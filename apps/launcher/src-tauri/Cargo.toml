@@ -1,0 +1,32 @@
+[package]
+name = "takumi-launcher"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = ["shell-open"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+uuid = { workspace = true }
+chrono = { workspace = true }
+zip.workspace = true
+
+# Shared libraries
+types.workspace = true
+auth-system.workspace = true
+download-manager.workspace = true
+minecraft-resolver.workspace = true
+instance-manager.workspace = true
+telemetry.workspace = true
+
+[features]
+# Enabled by `cargo tauri build`; embeds the frontend instead of using the dev server.
+custom-protocol = ["tauri/custom-protocol"]

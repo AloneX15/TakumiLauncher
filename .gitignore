@@ -1,0 +1,60 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+npm-debug.log
+pnpm-debug.log
+yarn-error.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-workspace
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Tauri
+src-tauri/target/
+
+# Build artifacts
+out/
+release/
+
+# Development
+.turbo/
+.cache/
+
+# Secrets and credentials (never commit)
+.env*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.crt
+*.cer
+secrets/
+
+# Launcher user data (accounts, settings, game files)
+accounts.json
+settings.json
+version_manifest.json
+
+# Tauri updater signing keys
+*.key.pub
+~/.tauri/

@@ -1,0 +1,21 @@
+[package]
+name = "download-manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+reqwest = { workspace = true }
+sha2.workspace = true
+hex.workspace = true
+sha1.workspace = true
+futures.workspace = true
