@@ -109,7 +109,7 @@ fn extract_overrides(pack: &Path, game_dir: &Path) -> anyhow::Result<()> {
     let mut archive = zip::ZipArchive::new(std::fs::File::open(pack)?)?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name()?.replace('\\', "/");
         let Some(relative) = OVERRIDE_DIRS.iter().find_map(|dir| name.strip_prefix(dir)) else {
             continue;
         };
@@ -303,7 +303,7 @@ mod tests {
         let pack = dir.join("pack.mrpack");
         {
             let mut writer = zip::ZipWriter::new(std::fs::File::create(&pack).unwrap());
-            let options = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             for (name, body) in [
                 ("modrinth.index.json", "{}"),
                 ("overrides/config/a.toml", "a"),

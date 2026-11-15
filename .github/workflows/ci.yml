@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    # Windows: the launcher's main target, and Tauri needs no system packages there.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -46,14 +47,21 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Test Rust
+      - name: Test libraries
         run: cargo test --workspace --lib
+
+      # The app crate is a binary; on Linux/macOS it would need the WebKit system packages.
+      - name: Test launcher app
+        if: runner.os == 'Windows'
+        run: cargo test -p takumi-launcher
 
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Tauri 1 needs libwebkit2gtk-4.0, which Ubuntu 24.04 no longer ships.
+        os: [ubuntu-22.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

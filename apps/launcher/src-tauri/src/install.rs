@@ -543,7 +543,7 @@ mod tests {
         let jar = dir.join("natives.jar");
         {
             let mut writer = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
-            let options = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             for (name, body) in [
                 ("lwjgl64.dll", "dll"),
                 ("nested/libopenal.so", "so"),

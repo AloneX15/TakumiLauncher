@@ -179,7 +179,7 @@ fn unpack_installer(installer: &Path, dir: &Path, libraries_dir: &Path) -> anyho
         // Modern format: profile and libraries are separate entries.
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
-            let name = entry.name().to_string();
+            let name = entry.name()?.to_string();
             let Some(relative) = name.strip_prefix("maven/") else {
                 continue;
             };
