@@ -22,6 +22,18 @@ export function megabytes(bytes) {
   return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
 }
 
+const compact = new Intl.NumberFormat('es', { notation: 'compact', maximumFractionDigits: 1 });
+
+/** 1234567 -> "1,2 M" */
+export function compactNumber(value) {
+  return compact.format(value);
+}
+
+/** Forge lists versions as "<minecraft>-<build>"; show only the build. */
+export function loaderVersionLabel(version, minecraft) {
+  return version.startsWith(`${minecraft}-`) ? version.slice(minecraft.length + 1) : version;
+}
+
 const LOADER_NAMES = {
   vanilla: 'Vanilla',
   fabric: 'Fabric',
@@ -37,8 +49,10 @@ export function loaderName(loader) {
 const STAGES = {
   auth: 'Iniciando sesión…',
   metadata: 'Preparando…',
+  repair: 'Comprobando archivos…',
   downloading: 'Descargando',
   java: 'Instalando Java',
+  loader: 'Instalando el cargador de mods',
   natives: 'Preparando librerías…',
   starting: 'Iniciando…',
   running: 'En ejecución',

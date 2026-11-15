@@ -1,15 +1,16 @@
 <script>
   import { createEventDispatcher } from 'svelte';
-  import { invoke } from '../lib/api.js';
-  import { describeLaunch, loaderName, timeAgo } from '../lib/format.js';
-  import { accounts, attempt, instances, launch, launches, stop, toast } from '../lib/stores.js';
+    import { describeLaunch, loaderName, loaderVersionLabel, timeAgo } from '../lib/format.js';
+  import { accounts, instances, launch, launches, stop, toast } from '../lib/stores.js';
   import NewInstanceModal from '../components/NewInstanceModal.svelte';
   import InstanceSettingsModal from '../components/InstanceSettingsModal.svelte';
+  import ModpackModal from '../components/ModpackModal.svelte';
 
   const dispatch = createEventDispatcher();
 
   let creating = false;
   let editing = null;
+  let importing = false;
 
   function play(instance) {
     if (!$accounts.active) {
@@ -19,8 +20,6 @@
     }
     launch(instance.id);
   }
-
-  const openFolder = (id) => attempt(invoke('open_instance_folder', { id }));
 </script>
 
 <header class="row">
@@ -29,6 +28,7 @@
     <p class="muted">Cada instancia tiene sus propios mundos, mods y ajustes.</p>
   </div>
   <div class="spacer" />
+  <button on:click={() => (importing = true)}>Instalar modpack</button>
   <button class="primary" on:click={() => (creating = true)}>+ Nueva instancia</button>
 </header>
 
@@ -51,7 +51,10 @@
             <div class="row tags">
               <span class="badge">{instance.minecraft_version}</span>
               {#if instance.mod_loader !== 'vanilla'}
-                <span class="badge accent">{loaderName(instance.mod_loader)} {instance.mod_loader_version}</span>
+                <span class="badge accent">
+                  {loaderName(instance.mod_loader)}
+                  {loaderVersionLabel(instance.mod_loader_version, instance.minecraft_version)}
+                </span>
               {/if}
             </div>
           </div>
@@ -82,8 +85,10 @@
           {:else}
             <button class="primary main" on:click={() => play(instance)}>Jugar</button>
           {/if}
+          <button title="Mods, paquetes de recursos y shaders" on:click={() => dispatch('content', instance.id)}>
+            Contenido
+          </button>
           <button title="Consola" on:click={() => dispatch('console', instance.id)}>Consola</button>
-          <button title="Abrir carpeta" on:click={() => openFolder(instance.id)}>Carpeta</button>
           <button title="Ajustes" aria-label="Ajustes" on:click={() => (editing = instance)}>⚙</button>
         </div>
       </article>
@@ -93,6 +98,9 @@
 
 {#if creating}
   <NewInstanceModal on:close={() => (creating = false)} />
+{/if}
+{#if importing}
+  <ModpackModal on:close={() => (importing = false)} />
 {/if}
 {#if editing}
   <InstanceSettingsModal instance={editing} on:close={() => (editing = null)} />

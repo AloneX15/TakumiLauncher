@@ -223,6 +223,9 @@ pub struct Library {
     /// Legacy natives: OS name -> classifier (may contain `${arch}`).
     #[serde(default)]
     pub natives: Option<HashMap<String, String>>,
+    /// Legacy Forge profiles mark server-only libraries with `false`.
+    #[serde(default)]
+    pub clientreq: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,7 +331,7 @@ pub fn resolve_libraries(info: &VersionInfo, env: &Env) -> Vec<ResolvedLibrary> 
     };
 
     for library in &info.libraries {
-        if !rules_allow(&library.rules, env) {
+        if !rules_allow(&library.rules, env) || library.clientreq == Some(false) {
             continue;
         }
 

@@ -1,6 +1,7 @@
 //! Makes an instance ready to launch: version metadata, client jar,
 //! libraries, assets, natives and a Java runtime.
 
+use crate::forge::{self, Family, ProcessorContext};
 use crate::launch::LaunchSink;
 use crate::settings::Settings;
 use crate::state::{write_atomic, AppState};
@@ -9,7 +10,7 @@ use download_manager::{DownloadJob, DownloadProgress};
 use minecraft_resolver::{
     fetch_json, fetch_text, is_safe_file_name, is_safe_relative_path, java_executable_path, java_runtime_platform,
     merge, resolve_libraries, AssetIndex, Env, JavaRuntimeIndex, JavaRuntimeManifest, LibraryKind, LoaderKind,
-    VersionInfo, ASSET_BASE_URL, JAVA_RUNTIME_URL,
+    LoaderVersion, VersionInfo, ASSET_BASE_URL, JAVA_RUNTIME_URL,
 };
 use std::path::{Path, PathBuf};
 use types::{Instance, ModLoader};
@@ -29,26 +30,65 @@ pub struct Prepared {
     pub logging_argument: Option<String>,
 }
 
-pub fn loader_kind(loader: ModLoader) -> anyhow::Result<Option<LoaderKind>> {
+/// How a mod loader is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderSource {
+    /// A ready-made launcher profile (Fabric, Quilt).
+    Profile(LoaderKind),
+    /// An installer jar that has to be processed (Forge, NeoForge).
+    Installer(Family),
+}
+
+pub fn loader_source(loader: ModLoader) -> Option<LoaderSource> {
     match loader {
-        ModLoader::Vanilla => Ok(None),
-        ModLoader::Fabric => Ok(Some(LoaderKind::Fabric)),
-        ModLoader::Quilt => Ok(Some(LoaderKind::Quilt)),
-        other => bail!("{other} todavía no está soportado."),
+        ModLoader::Vanilla => None,
+        ModLoader::Fabric => Some(LoaderSource::Profile(LoaderKind::Fabric)),
+        ModLoader::Quilt => Some(LoaderSource::Profile(LoaderKind::Quilt)),
+        ModLoader::Forge => Some(LoaderSource::Installer(Family::Forge)),
+        ModLoader::NeoForge => Some(LoaderSource::Installer(Family::NeoForge)),
     }
 }
 
+/// Loader versions available for a Minecraft version, newest first.
+pub async fn loader_versions(
+    state: &AppState,
+    loader: ModLoader,
+    minecraft: &str,
+) -> anyhow::Result<Vec<LoaderVersion>> {
+    match loader_source(loader) {
+        None => Ok(Vec::new()),
+        Some(LoaderSource::Profile(kind)) => Ok(kind.versions(state.http(), minecraft).await?),
+        Some(LoaderSource::Installer(family)) => family.versions(state.http(), minecraft).await,
+    }
+}
+
+/// The version a new instance gets when none is chosen explicitly.
+pub fn default_loader_version(available: &[LoaderVersion]) -> Option<&LoaderVersion> {
+    available.iter().find(|v| v.stable).or(available.first())
+}
+
+/// Download and check everything the instance needs to start.
+///
+/// With `repair`, files already on disk are re-hashed instead of trusted by
+/// size, and cached version metadata and the Java runtime are checked again,
+/// so corrupted or modified files are downloaded anew.
 pub async fn prepare(
     state: &AppState,
     instance: &Instance,
     settings: &Settings,
     sink: &dyn LaunchSink,
+    repair: bool,
 ) -> anyhow::Result<Prepared> {
     sink.status("metadata", None);
     let env = Env::current();
-    let info = resolve_version(state, instance).await?;
+    let info = resolve_version(state, instance, repair).await?;
 
     let mut jobs = Vec::new();
+
+    let installer = match loader_source(instance.mod_loader) {
+        Some(LoaderSource::Installer(family)) => Some(family),
+        _ => None,
+    };
 
     // Client jar (always the vanilla one; loaders patch it at runtime).
     let client = info
@@ -61,7 +101,8 @@ pub async fn prepare(
     jobs.push(
         DownloadJob::new(&client.url, &client_jar)
             .sha1(client.sha1.clone())
-            .size(client.size),
+            .size(client.size)
+            .verify_existing(repair),
     );
 
     // Libraries
@@ -70,17 +111,27 @@ pub async fn prepare(
     let mut native_jars = Vec::new();
     for library in resolve_libraries(&info, &env) {
         let destination = libraries_dir.join(&library.path);
-        jobs.push(
-            DownloadJob::new(&library.url, &destination)
-                .sha1(library.sha1)
-                .size(library.size),
-        );
+        // An empty URL marks a file that the loader's installer provides.
+        if !library.url.is_empty() {
+            jobs.push(
+                DownloadJob::new(&library.url, &destination)
+                    .sha1(library.sha1)
+                    .size(library.size)
+                    .verify_existing(repair),
+            );
+        }
         match library.kind {
             LibraryKind::Classpath => classpath.push(destination),
             LibraryKind::Native => native_jars.push(destination),
         }
     }
-    classpath.push(client_jar);
+    // Forge expects the game jar to be named after its own version id, as
+    // the official launcher does for inherited versions.
+    let launch_jar = match installer {
+        Some(_) if is_safe_file_name(&info.id) => client_jar.with_file_name(format!("{}.jar", info.id)),
+        _ => client_jar.clone(),
+    };
+    classpath.push(launch_jar.clone());
 
     // Assets
     let assets_dir = state.assets_dir();
@@ -94,7 +145,8 @@ pub async fn prepare(
     let index_path = assets_dir.join("indexes").join(format!("{}.json", asset_ref.id));
     let index_job = DownloadJob::new(&asset_ref.url, &index_path)
         .sha1(asset_ref.sha1.clone())
-        .size(asset_ref.size);
+        .size(asset_ref.size)
+        .verify_existing(repair);
     state.downloader.download_all(vec![index_job], |_| {}).await?;
     let index: AssetIndex =
         serde_json::from_str(&tokio::fs::read_to_string(&index_path).await?).context("Índice de recursos corrupto.")?;
@@ -107,7 +159,8 @@ pub async fn prepare(
         jobs.push(
             DownloadJob::new(format!("{ASSET_BASE_URL}{relative}"), objects_dir.join(&relative))
                 .sha1(Some(object.hash.clone()))
-                .size(Some(object.size)),
+                .size(Some(object.size))
+                .verify_existing(repair),
         );
     }
 
@@ -119,7 +172,8 @@ pub async fn prepare(
             jobs.push(
                 DownloadJob::new(&logging.file.url, &path)
                     .sha1(logging.file.sha1.clone())
-                    .size(logging.file.size),
+                    .size(logging.file.size)
+                    .verify_existing(repair),
             );
             logging_argument = Some(logging.argument.replace("${path}", &path.to_string_lossy()));
         }
@@ -130,6 +184,16 @@ pub async fn prepare(
         .downloader
         .download_all(jobs, |progress| sink.status("downloading", Some(progress)))
         .await?;
+
+    if launch_jar != client_jar {
+        let up_to_date = match (std::fs::metadata(&launch_jar), std::fs::metadata(&client_jar)) {
+            (Ok(copy), Ok(original)) => copy.len() == original.len(),
+            _ => false,
+        };
+        if !up_to_date {
+            tokio::fs::copy(&client_jar, &launch_jar).await?;
+        }
+    }
 
     let game_dir = state.instances.game_dir(instance.id);
     tokio::fs::create_dir_all(&game_dir).await?;
@@ -162,9 +226,19 @@ pub async fn prepare(
                 .as_ref()
                 .map(|java| java.component.as_str())
                 .unwrap_or("jre-legacy");
-            ensure_java_runtime(state, component, sink).await?
+            ensure_java_runtime(state, component, sink, repair).await?
         }
     };
+
+    if let Some(family) = installer {
+        let loader_version = instance.mod_loader_version.as_deref().unwrap_or_default();
+        let context = ProcessorContext {
+            minecraft_version: version,
+            client_jar: &client_jar,
+            java: &java,
+        };
+        forge::run_processors(state, family, loader_version, context, sink).await?;
+    }
 
     Ok(Prepared {
         info,
@@ -180,28 +254,37 @@ pub async fn prepare(
 }
 
 /// Load the instance's version metadata, merged with the mod loader profile.
-async fn resolve_version(state: &AppState, instance: &Instance) -> anyhow::Result<VersionInfo> {
+async fn resolve_version(state: &AppState, instance: &Instance, repair: bool) -> anyhow::Result<VersionInfo> {
     let version = &instance.minecraft_version;
     if !is_safe_file_name(version) {
         bail!("Versión de Minecraft no válida: {version}");
     }
-    let vanilla = load_vanilla_version(state, version).await?;
+    let vanilla = load_vanilla_version(state, version, repair).await?;
 
-    let Some(kind) = loader_kind(instance.mod_loader)? else {
+    let Some(source) = loader_source(instance.mod_loader) else {
         return Ok(vanilla);
     };
     let loader_version = instance
         .mod_loader_version
         .as_deref()
         .context("La instancia no tiene versión del cargador de mods.")?;
+    let kind = match source {
+        LoaderSource::Profile(kind) => kind,
+        LoaderSource::Installer(family) => {
+            let profile = forge::ensure_profile(state, family, loader_version).await?;
+            return Ok(merge(profile, vanilla));
+        }
+    };
     let id = kind.profile_id(version, loader_version);
     if !is_safe_file_name(&id) {
         bail!("Versión del cargador no válida: {loader_version}");
     }
 
     let path = state.versions_dir().join(&id).join(format!("{id}.json"));
-    let cached = std::fs::read_to_string(&path)
-        .ok()
+    // The loader profile has no published checksum: repair fetches it again.
+    let cached = (!repair)
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
         .and_then(|text| serde_json::from_str::<VersionInfo>(&text).ok());
     let profile = match cached {
         Some(profile) => profile,
@@ -215,18 +298,26 @@ async fn resolve_version(state: &AppState, instance: &Instance) -> anyhow::Resul
     Ok(merge(profile, vanilla))
 }
 
-async fn load_vanilla_version(state: &AppState, version: &str) -> anyhow::Result<VersionInfo> {
+async fn load_vanilla_version(state: &AppState, version: &str, repair: bool) -> anyhow::Result<VersionInfo> {
     let path = state.versions_dir().join(version).join(format!("{version}.json"));
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(info) = serde_json::from_str(&text) {
-            return Ok(info);
+    if !repair {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(info) = serde_json::from_str(&text) {
+                return Ok(info);
+            }
         }
     }
     let manifest = state.version_manifest().await?;
     let entry = manifest.find(version)?;
+    // Repair keeps the cached file when it still matches the manifest's hash.
     state
         .downloader
-        .download(&DownloadJob::new(&entry.url, &path).sha1(entry.sha1.clone()))
+        .download_all(
+            vec![DownloadJob::new(&entry.url, &path)
+                .sha1(entry.sha1.clone())
+                .verify_existing(true)],
+            |_| {},
+        )
         .await?;
     serde_json::from_str(&tokio::fs::read_to_string(&path).await?).context("Metadatos de versión no válidos.")
 }
@@ -305,14 +396,19 @@ fn extract_natives(jars: &[PathBuf], natives_dir: &Path) -> anyhow::Result<()> {
 
 /// Install Mojang's Java runtime `component` if needed and return the path
 /// of its executable.
-async fn ensure_java_runtime(state: &AppState, component: &str, sink: &dyn LaunchSink) -> anyhow::Result<PathBuf> {
+async fn ensure_java_runtime(
+    state: &AppState,
+    component: &str,
+    sink: &dyn LaunchSink,
+    repair: bool,
+) -> anyhow::Result<PathBuf> {
     if !is_safe_file_name(component) {
         bail!("Componente de Java no válido: {component}");
     }
     let dir = state.runtimes_dir().join(component);
     let executable = dir.join(java_executable_path());
     let marker = dir.join(".installed");
-    if marker.is_file() && executable.is_file() {
+    if !repair && marker.is_file() && executable.is_file() {
         return Ok(executable);
     }
 
@@ -342,13 +438,19 @@ async fn ensure_java_runtime(state: &AppState, component: &str, sink: &dyn Launc
                 let Some(raw) = file.downloads.as_ref().and_then(|d| d.raw.as_ref()) else {
                     continue;
                 };
-                jobs.push(DownloadJob::new(&raw.url, &path).sha1(raw.sha1.clone()).size(raw.size));
+                jobs.push(
+                    DownloadJob::new(&raw.url, &path)
+                        .sha1(raw.sha1.clone())
+                        .size(raw.size)
+                        .verify_existing(repair),
+                );
                 if file.executable {
                     executables.push(path);
                 }
             }
             "link" => {
-                if let Some(target) = &file.target {
+                // A link may only point at another file of the same runtime.
+                if let Some(target) = file.target.as_ref().filter(|target| link_stays_inside(name, target)) {
                     links.push((path, target.clone()));
                 }
             }
@@ -368,6 +470,28 @@ async fn ensure_java_runtime(state: &AppState, component: &str, sink: &dyn Launc
     }
     tokio::fs::write(&marker, b"").await?;
     Ok(executable)
+}
+
+/// Whether a symlink at `link` (relative to the runtime directory) pointing at
+/// `target` (relative to the link's own directory) resolves inside the runtime.
+fn link_stays_inside(link: &str, target: &str) -> bool {
+    if target.is_empty() || target.starts_with(['/', '\\']) || target.contains(':') {
+        return false;
+    }
+    let mut parts: Vec<&str> = link.split('/').collect();
+    parts.pop(); // the link's own name
+    for part in target.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return false;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    !parts.is_empty()
 }
 
 #[cfg(unix)]
@@ -396,6 +520,21 @@ fn finish_runtime_install(_executables: &[PathBuf], _links: &[(PathBuf, String)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn runtime_links_stay_inside_the_runtime() {
+        assert!(link_stays_inside(
+            "jre.bundle/Contents/MacOS/libjli.dylib",
+            "../Home/lib/libjli.dylib"
+        ));
+        assert!(link_stays_inside("bin/java", "../lib/java"));
+        assert!(link_stays_inside("legal/java.base/LICENSE", "../../legal/LICENSE"));
+        assert!(!link_stays_inside("bin/java", "../../evil"));
+        assert!(!link_stays_inside("java", "../x"));
+        assert!(!link_stays_inside("bin/java", "/usr/bin/evil"));
+        assert!(!link_stays_inside("bin/java", "C:\\evil"));
+        assert!(!link_stays_inside("bin/java", ""));
+    }
 
     #[test]
     fn extracts_only_native_libraries_flat() {
@@ -433,10 +572,27 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_loaders_are_rejected() {
-        assert!(loader_kind(ModLoader::Vanilla).unwrap().is_none());
-        assert_eq!(loader_kind(ModLoader::Fabric).unwrap(), Some(LoaderKind::Fabric));
-        assert!(loader_kind(ModLoader::Forge).is_err());
-        assert!(loader_kind(ModLoader::NeoForge).is_err());
+    fn loader_sources() {
+        assert!(loader_source(ModLoader::Vanilla).is_none());
+        assert_eq!(
+            loader_source(ModLoader::Fabric),
+            Some(LoaderSource::Profile(LoaderKind::Fabric))
+        );
+        assert_eq!(
+            loader_source(ModLoader::NeoForge),
+            Some(LoaderSource::Installer(Family::NeoForge))
+        );
+    }
+
+    #[test]
+    fn default_loader_version_prefers_stable() {
+        let version = |v: &str, stable| LoaderVersion {
+            version: v.into(),
+            stable,
+        };
+        let list = [version("3-beta", false), version("2", true), version("1", true)];
+        assert_eq!(default_loader_version(&list).unwrap().version, "2");
+        assert_eq!(default_loader_version(&list[..1]).unwrap().version, "3-beta");
+        assert!(default_loader_version(&[]).is_none());
     }
 }

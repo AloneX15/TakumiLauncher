@@ -57,6 +57,16 @@
     <span>Argumentos de JVM adicionales</span>
     <input bind:value={draft.jvm_args} placeholder="-XX:+UseG1GC" spellcheck="false" />
   </label>
+
+  <label class="row check">
+    <input type="checkbox" bind:checked={draft.optimize_game} />
+    <span>
+      Optimizar el juego automáticamente
+      <span class="muted small">
+        — ajusta la memoria y el recolector de basura de Java y da prioridad al juego. Tus argumentos tienen preferencia.
+      </span>
+    </span>
+  </label>
 </section>
 
 <section class="card">

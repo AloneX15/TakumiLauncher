@@ -4,7 +4,7 @@
 //! `auth-done` and `auth-error`.
 
 use crate::accounts::{self, Accounts, MISSING_CLIENT_ID};
-use crate::install::loader_kind;
+use crate::install;
 use crate::launch::{self, LaunchSink};
 use crate::settings::{Settings, MIN_MEMORY_MB};
 use crate::state::AppState;
@@ -21,11 +21,11 @@ use tokio::sync::oneshot;
 use types::{Instance, InstanceSettings, ModLoader};
 use uuid::Uuid;
 
-type CmdResult<T> = Result<T, String>;
-type AppStateRef<'a> = State<'a, Arc<AppState>>;
+pub type CmdResult<T> = Result<T, String>;
+pub type AppStateRef<'a> = State<'a, Arc<AppState>>;
 
 /// Flatten any error (including its causes) into a message for the UI.
-fn fail(error: impl std::fmt::Display) -> String {
+pub fn fail(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
 }
 
@@ -35,6 +35,8 @@ fn fail(error: impl std::fmt::Display) -> String {
 pub struct AppInfo {
     version: &'static str,
     data_dir: String,
+    /// Takumi website (registration, downloads, news).
+    web_url: String,
 }
 
 #[tauri::command]
@@ -42,6 +44,7 @@ pub fn get_app_info(state: AppStateRef<'_>) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION"),
         data_dir: state.root.to_string_lossy().into_owned(),
+        web_url: crate::session::web_url(),
     }
 }
 
@@ -103,10 +106,7 @@ pub async fn get_loader_versions(
     loader: ModLoader,
     version: String,
 ) -> CmdResult<Vec<LoaderVersion>> {
-    match loader_kind(loader).map_err(fail)? {
-        Some(kind) => kind.versions(state.http(), &version).await.map_err(fail),
-        None => Ok(Vec::new()),
-    }
+    install::loader_versions(&state, loader, &version).await.map_err(fail)
 }
 
 // ---------------------------------------------------------- instances
@@ -127,17 +127,16 @@ pub async fn create_instance(
     let manifest = state.version_manifest().await.map_err(fail)?;
     manifest.find(&version).map_err(fail)?;
 
-    let mod_loader_version = match loader_kind(loader).map_err(fail)? {
-        None => None,
-        Some(kind) => {
-            let available = kind.versions(state.http(), &version).await.map_err(fail)?;
-            let chosen = match loader_version {
-                Some(wanted) => available.iter().find(|v| v.version == wanted),
-                None => available.iter().find(|v| v.stable).or(available.first()),
-            };
-            let chosen = chosen.ok_or_else(|| format!("{loader} no está disponible para Minecraft {version}."))?;
-            Some(chosen.version.clone())
-        }
+    let mod_loader_version = if loader == ModLoader::Vanilla {
+        None
+    } else {
+        let available = install::loader_versions(&state, loader, &version).await.map_err(fail)?;
+        let chosen = match loader_version {
+            Some(wanted) => available.iter().find(|v| v.version == wanted),
+            None => install::default_loader_version(&available),
+        };
+        let chosen = chosen.ok_or_else(|| format!("{loader} no está disponible para Minecraft {version}."))?;
+        Some(chosen.version.clone())
     };
 
     state
@@ -348,6 +347,28 @@ pub fn stop_instance(state: AppStateRef<'_>, id: Uuid) {
     if let Some(sender) = sender {
         let _ = sender.send(());
     }
+}
+
+/// Verify every file of an instance (client, libraries, assets, Java) by hash
+/// and download again what does not match. Progress is reported with the same
+/// events as a launch; the instance cannot be started meanwhile.
+#[tauri::command]
+pub async fn repair_instance(app: AppHandle, state: AppStateRef<'_>, id: Uuid) -> CmdResult<()> {
+    let state = state.inner().clone();
+    {
+        let mut running = state.running.lock().unwrap();
+        if running.contains_key(&id) {
+            return Err("Esta instancia está en uso. Ciérrala antes de repararla.".into());
+        }
+        running.insert(id, None);
+    }
+    let sink = EventSink { app: app.clone(), id };
+    sink.status("repair", None);
+    let result = launch::repair(&state, id, &sink).await;
+    state.running.lock().unwrap().remove(&id);
+    // Clears the progress shown on the instance card.
+    let _ = app.emit_all("launch-exit", json!({ "instance_id": id, "code": null, "error": null }));
+    result.map_err(fail)
 }
 
 #[tauri::command]

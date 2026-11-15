@@ -127,6 +127,27 @@ impl InstanceStore {
         self.write(instance)
     }
 
+    /// Copy an instance, including its game directory, under a new id.
+    pub fn duplicate(&self, id: Uuid) -> InstanceResult<Instance> {
+        let source = self.get(id)?;
+        let now = Utc::now();
+        let copy = Instance {
+            id: Uuid::new_v4(),
+            name: copy_name(&source.name),
+            created_at: now,
+            updated_at: now,
+            last_played: None,
+            ..source
+        };
+        let target = self.instance_dir(copy.id);
+        let result = copy_dir(&self.instance_dir(id), &target).and_then(|()| self.write(&copy));
+        if let Err(error) = result {
+            let _ = std::fs::remove_dir_all(&target);
+            return Err(error);
+        }
+        Ok(copy)
+    }
+
     /// Delete an instance and all of its game data.
     pub fn delete(&self, id: Uuid) -> InstanceResult<()> {
         let dir = self.instance_dir(id);
@@ -145,6 +166,34 @@ impl InstanceStore {
         std::fs::rename(tmp, dir.join(METADATA_FILE))?;
         Ok(())
     }
+}
+
+/// "Name (copia)", shortened to stay within the name limit.
+fn copy_name(name: &str) -> String {
+    const SUFFIX: &str = " (copia)";
+    let keep = MAX_NAME_LEN - SUFFIX.chars().count();
+    let base: String = name.chars().take(keep).collect();
+    format!("{}{SUFFIX}", base.trim_end())
+}
+
+/// Recursively copy a directory. Extracted natives are skipped: they are
+/// regenerated on every launch.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> InstanceResult<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let destination = to.join(entry.file_name());
+        if kind.is_dir() {
+            if from.join("instance.json").is_file() && entry.file_name() == "natives" {
+                continue;
+            }
+            copy_dir(&entry.path(), &destination)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str) -> InstanceResult<String> {
@@ -190,6 +239,31 @@ mod tests {
         assert!(matches!(store.get(instance.id), Err(InstanceError::NotFound)));
         assert!(store.list().unwrap().is_empty());
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_copies_game_data() {
+        let (store, root) = store();
+        let mut original = store.create(new_instance(&"n".repeat(64))).unwrap();
+        original.settings.memory_mb = Some(2048);
+        store.save(&mut original).unwrap();
+        let saves = store.game_dir(original.id).join("saves/world");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(saves.join("level.dat"), "data").unwrap();
+        std::fs::create_dir_all(store.natives_dir(original.id)).unwrap();
+        std::fs::write(store.natives_dir(original.id).join("x.dll"), "n").unwrap();
+
+        let copy = store.duplicate(original.id).unwrap();
+        assert_ne!(copy.id, original.id);
+        assert!(copy.name.ends_with("(copia)") && copy.name.chars().count() <= 64);
+        assert_eq!(copy.settings.memory_mb, Some(2048));
+        assert_eq!(
+            std::fs::read_to_string(store.game_dir(copy.id).join("saves/world/level.dat")).unwrap(),
+            "data"
+        );
+        assert!(!store.natives_dir(copy.id).exists());
+        assert_eq!(store.list().unwrap().len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 

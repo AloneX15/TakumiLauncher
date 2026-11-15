@@ -1,12 +1,12 @@
 <script>
   import { createEventDispatcher, onMount } from 'svelte';
   import { invoke } from '../lib/api.js';
-  import { loaderName } from '../lib/format.js';
+  import { loaderName, loaderVersionLabel } from '../lib/format.js';
   import { attempt, refreshInstances, settingsView, toast } from '../lib/stores.js';
   import Modal from './Modal.svelte';
 
   const dispatch = createEventDispatcher();
-  const LOADERS = ['vanilla', 'fabric', 'quilt'];
+  const LOADERS = ['vanilla', 'fabric', 'quilt', 'forge', 'neoforge'];
   const LATEST = '';
 
   let versions = [];
@@ -114,7 +114,7 @@
         {:else}
           <option value={LATEST}>Última estable (recomendada)</option>
           {#each loaderVersions as v (v.version)}
-            <option value={v.version}>{v.version}{v.stable ? '' : ' (beta)'}</option>
+            <option value={v.version}>{loaderVersionLabel(v.version, version)}</option>
           {/each}
         {/if}
       </select>
@@ -146,9 +146,13 @@
 
   .segmented {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 6px;
     margin-bottom: 14px;
+  }
+
+  .segmented button {
+    padding: 7px 4px;
   }
 
   .segmented button.selected {

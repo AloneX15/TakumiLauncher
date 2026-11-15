@@ -1,0 +1,128 @@
+name: Release
+
+# Push a tag like v0.2.0 (or v0.3.0-beta.1 for the beta channel):
+#   git tag -a v0.2.0 -m "- Novedad 1\n- Corrección 2" && git push origin v0.2.0
+# The tag message becomes the release notes on GitHub and on takumilabs.org.
+#
+# Repository secrets needed to publish on the website (Settings → Secrets → Actions):
+#   TAKUMI_WEB_URL        e.g. https://takumilabs.org
+#   TAKUMI_RELEASE_TOKEN  same value as RELEASE_API_TOKEN on the web server
+# Without them the GitHub release is still created; only the website step is skipped.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    environment: release
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Check tag matches the app version
+        shell: bash
+        run: |
+          app=$(node -p "require('./apps/launcher/src-tauri/tauri.conf.json').package.version")
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${TAG#v}"
+          if [ "$tag" != "$app" ] || [ "$tag" != "$crate" ]; then
+            echo "::error::Tag $TAG does not match tauri.conf.json ($app) / Cargo.toml ($crate). Bump both before tagging."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 12
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          npm install --global @tauri-apps/cli@1.6.3
+
+      - name: Build installer
+        working-directory: apps/launcher
+        env:
+          # Baked into the binary; without it the launcher talks to http://localhost:5173.
+          TAKUMI_WEB_URL: ${{ secrets.TAKUMI_WEB_URL || 'https://takumilabs.org' }}
+        run: tauri build --bundles nsis
+
+      - name: Create GitHub release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          installer=$(ls target/release/bundle/nsis/*-setup.exe | head -n1)
+          name=$(basename "$installer")
+          notes=$(git tag -l --format='%(contents)' "$TAG")
+          prerelease=""
+          channel="stable"
+          if [[ "$TAG" == *-* ]]; then prerelease="--prerelease"; channel="beta"; fi
+
+          if [ -n "$notes" ]; then
+            gh release create "$TAG" "$installer" --title "Takumi Launcher ${TAG#v}" --notes "$notes" $prerelease
+          else
+            gh release create "$TAG" "$installer" --title "Takumi Launcher ${TAG#v}" --generate-notes $prerelease
+          fi
+
+          {
+            echo "installer=$installer"
+            echo "name=$name"
+            echo "channel=$channel"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish on takumilabs.org
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEB_URL: ${{ secrets.TAKUMI_WEB_URL }}
+          RELEASE_TOKEN: ${{ secrets.TAKUMI_RELEASE_TOKEN }}
+          INSTALLER: ${{ steps.release.outputs.installer }}
+          NAME: ${{ steps.release.outputs.name }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+        run: |
+          if [ -z "$WEB_URL" ] || [ -z "$RELEASE_TOKEN" ]; then
+            echo "::warning::TAKUMI_WEB_URL / TAKUMI_RELEASE_TOKEN not set; the release was not published on the website."
+            exit 0
+          fi
+          release=$(gh release view "$TAG" --json url,body,assets)
+          download_url=$(echo "$release" | jq -r --arg n "$NAME" '.assets[] | select(.name == $n) | .url')
+          payload=$(jq -n \
+            --arg version "${TAG#v}" \
+            --arg channel "$CHANNEL" \
+            --arg notes "$(echo "$release" | jq -r .body)" \
+            --arg download_url "$download_url" \
+            --arg file_name "$NAME" \
+            --argjson file_size "$(stat -c %s "$INSTALLER")" \
+            --arg sha256 "$(sha256sum "$INSTALLER" | cut -d' ' -f1)" \
+            --arg github_url "$(echo "$release" | jq -r .url)" \
+            '{version: $version, channel: $channel, notes: $notes, download_url: $download_url,
+              file_name: $file_name, file_size: $file_size, sha256: $sha256, github_url: $github_url, publish: true}')
+          curl --fail-with-body --silent --show-error \
+            -X POST "${WEB_URL%/}/api/releases" \
+            -H "Authorization: Bearer $RELEASE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload"

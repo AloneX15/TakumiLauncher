@@ -1,28 +1,49 @@
 <script>
   import { onMount } from 'svelte';
-  import { isTauri } from './lib/api.js';
-  import { accounts, appInfo, init, instances, toasts, dismissToast } from './lib/stores.js';
+  import { invoke, isTauri, openExternal } from './lib/api.js';
+  import { accounts, appInfo, attempt, init, instances, launcherUpdate, session, toasts, dismissToast } from './lib/stores.js';
+  import Login from './views/Login.svelte';
+  import Logo from './components/Logo.svelte';
   import Instances from './views/Instances.svelte';
   import Accounts from './views/Accounts.svelte';
   import Settings from './views/Settings.svelte';
   import Console from './views/Console.svelte';
+  import Content from './views/Content.svelte';
+  import News from './views/News.svelte';
 
   const NAV = [
     { id: 'instances', label: 'Instancias' },
+    { id: 'news', label: 'Noticias' },
     { id: 'accounts', label: 'Cuentas' },
     { id: 'settings', label: 'Ajustes' },
   ];
 
   let view = 'instances';
   let consoleId = null;
+  let contentId = null;
   let ready = false;
 
   $: active = $accounts.accounts.find((a) => a.id === $accounts.active);
   $: consoleInstance = $instances.find((i) => i.id === consoleId);
+  $: contentInstance = $instances.find((i) => i.id === contentId);
+  $: inInstances = ['instances', 'console', 'content'].includes(view);
+
+  function openContent(event) {
+    contentId = event.detail;
+    view = 'content';
+  }
 
   function openConsole(event) {
     consoleId = event.detail;
     view = 'console';
+  }
+
+  async function logout() {
+    // `attempt` yields undefined only on failure; a successful logout resolves to null.
+    if ((await attempt(invoke('takumi_logout'))) !== undefined) {
+      session.set(null);
+      view = 'instances';
+    }
   }
 
   onMount(async () => {
@@ -31,10 +52,16 @@
   });
 </script>
 
+{#if !ready}
+  <!-- Checking the session with the server: a splash instead of flashing the shell. -->
+  <div class="splash"><Logo size={72} /></div>
+{:else if !$session}
+  <Login />
+{:else}
 <div class="shell">
   <aside>
     <div class="brand">
-      <div class="logo">T</div>
+      <Logo size={40} />
       <div>
         <div class="name">TAKUMI</div>
         <div class="muted small">Launcher</div>
@@ -45,7 +72,7 @@
       {#each NAV as item}
         <button
           class="ghost nav"
-          class:current={view === item.id || (view === 'console' && item.id === 'instances')}
+          class:current={view === item.id || (inInstances && item.id === 'instances')}
           on:click={() => (view = item.id)}
         >
           {item.label}
@@ -54,6 +81,13 @@
     </nav>
 
     <div class="spacer" />
+
+    {#if $launcherUpdate}
+      <button class="update" on:click={() => openExternal($launcherUpdate.download_url)}>
+        <span class="update-title">Nueva versión {$launcherUpdate.version}</span>
+        <span class="small">Descárgala desde la web</span>
+      </button>
+    {/if}
 
     <button class="ghost account" on:click={() => (view = 'accounts')}>
       {#if active}
@@ -70,6 +104,17 @@
         </div>
       {/if}
     </button>
+    {#if $session}
+      <div class="row takumi">
+        <button
+          class="link small takumi-user"
+          title="Abrir mi cuenta en la web"
+          on:click={() => openExternal(`${$appInfo?.web_url}/cuenta`)}>{$session.username}</button
+        >
+        <div class="spacer" />
+        <button class="ghost small" on:click={logout}>Cerrar sesión</button>
+      </div>
+    {/if}
     {#if $appInfo}
       <div class="version muted small">v{$appInfo.version}</div>
     {/if}
@@ -82,20 +127,25 @@
       </div>
     {/if}
     {#if ready}
-      {#if view === 'instances'}
-        <Instances on:console={openConsole} on:accounts={() => (view = 'accounts')} />
-      {:else if view === 'accounts'}
+      {#if view === 'accounts'}
         <Accounts on:settings={() => (view = 'settings')} />
+      {:else if view === 'news'}
+        <News />
       {:else if view === 'settings'}
         <Settings />
       {:else if view === 'console' && consoleInstance}
         <Console instance={consoleInstance} on:back={() => (view = 'instances')} />
+      {:else if view === 'content' && contentInstance}
+        {#key contentInstance.id}
+          <Content instance={contentInstance} on:back={() => (view = 'instances')} />
+        {/key}
       {:else}
-        <Instances on:console={openConsole} on:accounts={() => (view = 'accounts')} />
+        <Instances on:console={openConsole} on:content={openContent} on:accounts={() => (view = 'accounts')} />
       {/if}
     {/if}
   </main>
 </div>
+{/if}
 
 <div class="toasts">
   {#each $toasts as item (item.id)}
@@ -124,18 +174,6 @@
     align-items: center;
     gap: 12px;
     padding: 0 8px 22px;
-  }
-
-  .logo {
-    width: 38px;
-    height: 38px;
-    border-radius: 10px;
-    background: linear-gradient(145deg, var(--accent-hover), #8f0d27);
-    display: grid;
-    place-items: center;
-    font-weight: 800;
-    font-size: 20px;
-    color: #fff;
   }
 
   .name {
@@ -195,6 +233,69 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .takumi {
+    padding: 4px 0 0 8px;
+    gap: 6px;
+  }
+
+  .splash {
+    height: 100%;
+    display: grid;
+    place-items: center;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  .update {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    text-align: left;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    color: var(--text);
+  }
+
+  .update:hover:not(:disabled) {
+    background: rgba(220, 20, 60, 0.24);
+  }
+
+  .update-title {
+    font-weight: 700;
+  }
+
+  .takumi .takumi-user {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--muted);
+    font-weight: 500;
+    text-align: left;
+  }
+
+  .takumi .takumi-user:hover:not(:disabled) {
+    background: none;
+    color: var(--text);
+    text-decoration: underline;
+  }
+
+  .takumi button {
+    padding: 4px 8px;
+    flex-shrink: 0;
   }
 
   .version {

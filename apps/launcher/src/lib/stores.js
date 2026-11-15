@@ -8,6 +8,10 @@ export const accounts = writable({ accounts: [], active: null });
 /** `{ settings, microsoft_login_available }` */
 export const settingsView = writable(null);
 export const appInfo = writable(null);
+/** Signed-in Takumi account: `{ username, email, role }` or null. */
+export const session = writable(null);
+/** Newer launcher release: `{ version, notes, download_url, page_url }` or null. */
+export const launcherUpdate = writable(null);
 /** Instance id -> `{ stage, progress }` while preparing or running. */
 export const launches = writable({});
 /** Instance id -> array of console lines. */
@@ -119,20 +123,32 @@ export async function init() {
       accounts.set(updated);
       toast('Sesión iniciada correctamente.', 'success');
     }),
+    // The session is shown from cache at start-up and checked in the background.
+    listen('session-changed', (updated) => session.set(updated)),
+    listen('session-ended', () => {
+      session.set(null);
+      toast('Tu sesión de Takumi ha caducado o se ha cerrado. Vuelve a iniciar sesión.', 'error');
+    }),
     listen('auth-error', (error) => {
       deviceCode.set(null);
       toast(error, 'error');
     }),
   ]);
 
-  const [info, accountList, settings, running] = await Promise.all([
+  const [info, accountList, settings, running, current] = await Promise.all([
     attempt(invoke('get_app_info')),
     attempt(invoke('list_accounts')),
     attempt(invoke('get_settings')),
     attempt(invoke('running_instances')),
+    attempt(invoke('get_session')),
     refreshInstances(),
   ]);
   if (info) appInfo.set(info);
+  session.set(current ?? null);
+  // Not awaited: the update notice must never delay startup.
+  invoke('check_launcher_update')
+    .then((update) => launcherUpdate.set(update ?? null))
+    .catch(() => {});
   if (accountList) accounts.set(accountList);
   if (settings) settingsView.set(settings);
   // Survives a frontend reload while a game is still running.

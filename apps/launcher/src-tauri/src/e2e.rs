@@ -11,7 +11,7 @@
 //! ```
 
 use crate::accounts::{offline_account, Accounts};
-use crate::install::loader_kind;
+use crate::install;
 use crate::launch::{self, LaunchSink};
 use crate::state::AppState;
 use download_manager::DownloadProgress;
@@ -58,6 +58,8 @@ async fn e2e_install_and_launch() {
     let loader = match std::env::var("TAKUMI_E2E_LOADER").as_deref() {
         Ok("fabric") => ModLoader::Fabric,
         Ok("quilt") => ModLoader::Quilt,
+        Ok("forge") => ModLoader::Forge,
+        Ok("neoforge") => ModLoader::NeoForge,
         _ => ModLoader::Vanilla,
     };
     let root = std::env::var("TAKUMI_E2E_ROOT")
@@ -70,14 +72,9 @@ async fn e2e_install_and_launch() {
     accounts.upsert(offline_account("TakumiTest").unwrap());
     accounts.save(&state.root).unwrap();
 
-    let mod_loader_version = match loader_kind(loader).unwrap() {
-        Some(kind) => {
-            let versions = kind.versions(state.http(), &version).await.unwrap();
-            let chosen = versions.iter().find(|v| v.stable).or(versions.first()).unwrap();
-            Some(chosen.version.clone())
-        }
-        None => None,
-    };
+    let available = install::loader_versions(&state, loader, &version).await.unwrap();
+    let mod_loader_version = install::default_loader_version(&available).map(|v| v.version.clone());
+    println!("loader version: {mod_loader_version:?}");
     let instance = state
         .instances
         .create(NewInstance {
@@ -111,4 +108,112 @@ async fn e2e_install_and_launch() {
     assert!(state.instances.get(instance.id).unwrap().last_played.is_some());
 
     state.instances.delete(instance.id).unwrap();
+}
+
+/// Content management and modpack import against the real Modrinth API.
+/// Downloads a few mods and one small modpack; does not start the game.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "talks to Modrinth and downloads files"]
+async fn e2e_content_and_modpack() {
+    use crate::content::{self, ContentKind};
+    use crate::modpack;
+
+    let root = std::env::temp_dir().join("takumi-launcher-e2e-content");
+    let _ = std::fs::remove_dir_all(&root);
+    let state = AppState::new(root.clone()).unwrap();
+    let instance = state
+        .instances
+        .create(NewInstance {
+            name: "content".into(),
+            minecraft_version: "1.21.1".into(),
+            mod_loader: ModLoader::Fabric,
+            mod_loader_version: Some("0.16.9".into()),
+        })
+        .unwrap();
+
+    // Search is filtered to what the instance can use.
+    let found = content::search_for_instance(state.http(), &instance, ContentKind::Mod, "iris shaders", 0)
+        .await
+        .unwrap();
+    let iris = found
+        .hits
+        .iter()
+        .find(|hit| hit.title.contains("Iris"))
+        .expect("Iris in results");
+
+    // Iris requires Sodium: both must be installed.
+    let installed = content::install_project(&state, &instance, ContentKind::Mod, &iris.project_id)
+        .await
+        .unwrap();
+    println!("installed: {installed:?}");
+    assert!(installed.iter().any(|t| t.contains("Iris")) && installed.iter().any(|t| t.contains("Sodium")));
+    assert!(
+        content::install_project(&state, &instance, ContentKind::Mod, &iris.project_id)
+            .await
+            .is_err()
+    );
+
+    let items = content::list(&state, &instance).unwrap();
+    assert_eq!(items.len(), installed.len());
+    assert!(items.iter().all(|i| i.enabled && i.title.is_some() && i.size > 0));
+
+    // Freshly installed files have no updates.
+    assert!(content::check_updates(&state, &instance).await.unwrap().is_empty());
+
+    // Disable, re-enable and remove.
+    let file = items[0].filename.clone();
+    content::set_enabled(&state, &instance, ContentKind::Mod, &file, false).unwrap();
+    let disabled = content::list(&state, &instance).unwrap();
+    let entry = disabled.iter().find(|i| !i.enabled).expect("one disabled item");
+    assert!(entry.filename.ends_with(".disabled") && entry.title.is_some());
+    content::set_enabled(&state, &instance, ContentKind::Mod, &entry.filename, true).unwrap();
+    content::remove(&state, &instance, ContentKind::Mod, &file).unwrap();
+    assert_eq!(content::list(&state, &instance).unwrap().len(), installed.len() - 1);
+    assert!(content::remove(&state, &instance, ContentKind::Mod, "../instance.json").is_err());
+
+    // An outdated file is detected by hash and replaced.
+    let sodium_versions = content::project_versions(state.http(), "sodium", &["fabric"], Some("1.21.1"))
+        .await
+        .unwrap();
+    assert!(sodium_versions.len() > 1, "need an older Sodium to test updates");
+    let old = sodium_versions.last().unwrap().primary_file().unwrap().clone();
+    let mods = state.instances.game_dir(instance.id).join("mods");
+    for item in content::list(&state, &instance).unwrap() {
+        content::remove(&state, &instance, ContentKind::Mod, &item.filename).unwrap();
+    }
+    state
+        .downloader
+        .download(&download_manager::DownloadJob::new(&old.url, mods.join(&old.filename)))
+        .await
+        .unwrap();
+    let updates = content::check_updates(&state, &instance).await.unwrap();
+    println!("updates: {updates:?}");
+    assert_eq!(updates.len(), 1);
+    content::update(&state, &instance, ContentKind::Mod, &old.filename)
+        .await
+        .unwrap();
+    let after = content::list(&state, &instance).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_ne!(after[0].filename, old.filename);
+    assert!(content::check_updates(&state, &instance).await.unwrap().is_empty());
+
+    // Modpack from Modrinth: instance with the pack's loader and its mods.
+    let pack = modpack::install_from_modrinth(&state, "fabulously-optimized", &|_| {})
+        .await
+        .unwrap();
+    println!(
+        "modpack: {} · {} · {} {:?}",
+        pack.name, pack.minecraft_version, pack.mod_loader, pack.mod_loader_version
+    );
+    assert_eq!(pack.mod_loader, ModLoader::Fabric);
+    assert!(pack.mod_loader_version.is_some());
+    let pack_items = content::list(&state, &pack).unwrap();
+    println!("modpack files: {}", pack_items.len());
+    assert!(pack_items.len() > 10);
+    assert!(
+        state.instances.game_dir(pack.id).join("config").is_dir(),
+        "overrides extracted"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
 }

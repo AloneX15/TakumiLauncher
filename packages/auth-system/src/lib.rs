@@ -49,7 +49,7 @@ pub struct DeviceCode {
 }
 
 /// An authenticated Minecraft session
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MinecraftSession {
     pub access_token: String,
     /// Profile UUID without dashes.
@@ -59,6 +59,19 @@ pub struct MinecraftSession {
     pub refresh_token: String,
     /// Unix timestamp after which `access_token` is no longer valid.
     pub expires_at: i64,
+}
+
+/// Tokens are never printed, so a `{:?}` in a log or error cannot leak them.
+impl std::fmt::Debug for MinecraftSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MinecraftSession")
+            .field("access_token", &"<redacted>")
+            .field("uuid", &self.uuid)
+            .field("username", &self.username)
+            .field("refresh_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl MinecraftSession {
@@ -359,6 +372,20 @@ mod tests {
         let serialized = serde_json::to_value(&code).unwrap();
         assert!(serialized.get("device_code").is_none());
         assert_eq!(serialized["user_code"], "ABCD1234");
+    }
+
+    #[test]
+    fn session_debug_hides_tokens() {
+        let session = MinecraftSession {
+            access_token: "access-secret".into(),
+            uuid: "abc".into(),
+            username: "Steve".into(),
+            refresh_token: "refresh-secret".into(),
+            expires_at: 1,
+        };
+        let printed = format!("{session:?}");
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(printed.contains("Steve"));
     }
 
     #[test]

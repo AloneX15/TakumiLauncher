@@ -74,6 +74,11 @@ impl Checksum {
     }
 }
 
+/// Lowercase hex SHA-1 of `data`.
+pub fn sha1_hex(data: &[u8]) -> String {
+    hex::encode(Sha1::digest(data))
+}
+
 enum Hasher {
     Sha1(Sha1),
     Sha256(Sha256),
@@ -113,6 +118,9 @@ pub struct DownloadJob {
     pub destination: PathBuf,
     pub checksum: Option<Checksum>,
     pub size: Option<u64>,
+    /// Re-hash a file that is already on disk instead of trusting its size
+    /// ("repair": finds corrupted or modified files).
+    pub verify_existing: bool,
 }
 
 impl DownloadJob {
@@ -122,7 +130,13 @@ impl DownloadJob {
             destination: destination.into(),
             checksum: None,
             size: None,
+            verify_existing: false,
         }
+    }
+
+    pub fn verify_existing(mut self, verify: bool) -> Self {
+        self.verify_existing = verify;
+        self
     }
 
     pub fn sha1(mut self, hash: Option<String>) -> Self {
@@ -138,22 +152,40 @@ impl DownloadJob {
     /// Whether the destination already holds this file.
     ///
     /// When the size is known it is compared (cheap, used for the thousands of
-    /// asset objects); otherwise the checksum is computed if there is one.
+    /// asset objects on every launch); otherwise, or with `verify_existing`,
+    /// the checksum is computed if there is one.
     fn already_present(&self) -> bool {
         let Ok(meta) = std::fs::metadata(&self.destination) else {
             return false;
         };
-        if !meta.is_file() {
+        if !meta.is_file() || self.size.is_some_and(|size| meta.len() != size) {
             return false;
         }
-        match (self.size, &self.checksum) {
-            (Some(size), _) => meta.len() == size,
-            (None, Some(checksum)) => std::fs::read(&self.destination)
-                .map(|data| checksum.matches(&data))
-                .unwrap_or(false),
-            (None, None) => true,
+        match &self.checksum {
+            Some(checksum) if self.verify_existing || self.size.is_none() => file_matches(&self.destination, checksum),
+            _ => true,
         }
     }
+}
+
+/// Stream `path` through the checksum's hash without loading it into memory.
+fn file_matches(path: &std::path::Path, checksum: &Checksum) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = Hasher::new(Some(checksum));
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    hasher
+        .finish()
+        .is_some_and(|h| h.eq_ignore_ascii_case(checksum.expected()))
 }
 
 /// Aggregate progress of a batch of downloads
@@ -194,6 +226,24 @@ impl Tracker<'_> {
     }
 }
 
+/// Follows up to 10 redirects but never from https to plain http: some
+/// downloads (loader profiles, the Java runtime index) carry no checksum, so
+/// TLS is their only integrity guarantee and must hold for the whole chain.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let downgrade =
+            attempt.previous().iter().any(|url| url.scheme() == "https") && attempt.url().scheme() != "https";
+        if downgrade {
+            let message = format!("redirección insegura a {}", attempt.url());
+            attempt.error(message)
+        } else if attempt.previous().len() >= 10 {
+            attempt.error("demasiadas redirecciones")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 /// Download engine
 pub struct Downloader {
     client: reqwest::Client,
@@ -205,6 +255,7 @@ impl Downloader {
         let client = reqwest::Client::builder()
             .user_agent(concat!("TakumiLauncher/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
+            .redirect(redirect_policy())
             .build()
             .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
         Ok(Self { client, config })
@@ -223,12 +274,17 @@ impl Downloader {
     where
         F: Fn(DownloadProgress) + Send + Sync,
     {
-        let mut seen = HashSet::new();
-        let pending: Vec<DownloadJob> = jobs
-            .into_iter()
-            .filter(|job| seen.insert(job.destination.clone()))
-            .filter(|job| !job.already_present())
-            .collect();
+        // Checking what is already on disk may hash many files (repair), so it
+        // runs off the async workers.
+        let pending: Vec<DownloadJob> = tokio::task::spawn_blocking(move || {
+            let mut seen = HashSet::new();
+            jobs.into_iter()
+                .filter(|job| seen.insert(job.destination.clone()))
+                .filter(|job| !job.already_present())
+                .collect()
+        })
+        .await
+        .map_err(|e| DownloadError::DownloadFailed(e.to_string()))?;
 
         let tracker = Tracker {
             files_total: pending.len() as u64,
@@ -383,6 +439,27 @@ mod tests {
             .sha1(Some("00".into()))
             .already_present());
         assert!(!DownloadJob::new("http://x", dir.join("missing")).already_present());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repair_rehashes_files_with_the_right_size() {
+        let dir = std::env::temp_dir().join(format!("takumi-dl-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.jar");
+        std::fs::write(&file, b"abc").unwrap();
+        let good = Some(sha1_hex(b"abc"));
+        let bad = Some(sha1_hex(b"xyz"));
+
+        // Normal launches trust the size; repair checks the content.
+        let tampered = DownloadJob::new("http://x", &file).sha1(bad).size(Some(3));
+        assert!(tampered.already_present());
+        assert!(!tampered.verify_existing(true).already_present());
+        let intact = DownloadJob::new("http://x", &file)
+            .sha1(good)
+            .size(Some(3))
+            .verify_existing(true);
+        assert!(intact.already_present());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

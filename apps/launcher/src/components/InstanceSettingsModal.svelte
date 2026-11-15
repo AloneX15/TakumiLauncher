@@ -1,8 +1,8 @@
 <script>
   import { createEventDispatcher } from 'svelte';
   import { invoke } from '../lib/api.js';
-  import { loaderName } from '../lib/format.js';
-  import { launches, refreshInstances, settingsView, toast } from '../lib/stores.js';
+  import { loaderName, loaderVersionLabel } from '../lib/format.js';
+  import { attempt, launches, refreshInstances, settingsView, toast } from '../lib/stores.js';
   import Modal from './Modal.svelte';
 
   export let instance;
@@ -19,6 +19,8 @@
   let height = instance.settings.height ?? '';
   let saving = false;
   let confirmingDelete = false;
+  let duplicating = false;
+  let repairing = false;
 
   $: busy = Boolean($launches[instance.id]);
 
@@ -47,6 +49,25 @@
     }
   }
 
+  async function duplicate() {
+    duplicating = true;
+    const copy = await attempt(invoke('duplicate_instance', { id: instance.id }));
+    duplicating = false;
+    if (copy) {
+      await refreshInstances();
+      toast(`Instancia «${copy.name}» creada.`, 'success');
+      dispatch('close');
+    }
+  }
+
+  /** Re-hash every game file and download again whatever does not match. */
+  async function repair() {
+    repairing = true;
+    const done = await attempt(invoke('repair_instance', { id: instance.id }).then(() => true));
+    repairing = false;
+    if (done) toast('Archivos comprobados. Se ha descargado de nuevo lo que estaba dañado.', 'success');
+  }
+
   async function remove() {
     try {
       await invoke('delete_instance', { id: instance.id });
@@ -61,7 +82,10 @@
 <Modal title="Ajustes de la instancia" on:close>
   <p class="muted small summary">
     Minecraft {instance.minecraft_version}
-    {#if instance.mod_loader !== 'vanilla'}· {loaderName(instance.mod_loader)} {instance.mod_loader_version}{/if}
+    {#if instance.mod_loader !== 'vanilla'}
+      · {loaderName(instance.mod_loader)}
+      {loaderVersionLabel(instance.mod_loader_version, instance.minecraft_version)}
+    {/if}
   </p>
 
   <label class="field">
@@ -95,6 +119,20 @@
     <input bind:value={jvmArgs} placeholder={global?.jvm_args || 'Ninguno'} spellcheck="false" />
   </label>
 
+  <div class="row tools">
+    <button on:click={() => attempt(invoke('open_instance_folder', { id: instance.id }))}>Abrir carpeta</button>
+    <button disabled={busy || duplicating} on:click={duplicate}>
+      {duplicating ? 'Duplicando…' : 'Duplicar instancia'}
+    </button>
+    <button
+      disabled={busy || repairing}
+      title="Comprueba el hash de cada archivo del juego y vuelve a descargar los que estén dañados o modificados"
+      on:click={repair}
+    >
+      {repairing ? 'Reparando…' : 'Reparar archivos'}
+    </button>
+  </div>
+
   <svelte:fragment slot="footer">
     {#if confirmingDelete}
       <button class="danger" on:click={remove}>Sí, eliminar con sus mundos</button>
@@ -118,6 +156,10 @@
 <style>
   .summary {
     margin-bottom: 14px;
+  }
+
+  .tools {
+    margin: 4px 0 8px;
   }
 
   .pair {

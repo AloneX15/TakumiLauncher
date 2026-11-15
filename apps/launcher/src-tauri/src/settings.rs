@@ -19,6 +19,8 @@ pub struct Settings {
     /// Azure application (client) id used for Microsoft sign-in.
     pub ms_client_id: String,
     pub show_snapshots: bool,
+    /// Tune the JVM (heap, garbage collector) and process priority for the game.
+    pub optimize_game: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             jvm_args: String::new(),
             ms_client_id: String::new(),
             show_snapshots: false,
+            optimize_game: true,
         }
     }
 }
@@ -78,6 +81,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"memory_mb": 2048}"#).unwrap();
         assert_eq!(settings.memory_mb, 2048);
         assert!(settings.java_path.is_none());
+        assert!(settings.optimize_game);
         assert!(!settings.show_snapshots);
     }
 

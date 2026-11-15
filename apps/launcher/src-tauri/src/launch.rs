@@ -24,6 +24,15 @@ pub trait LaunchSink: Send + Sync {
     fn log(&self, line: String);
 }
 
+/// Re-check every file the instance uses against its published hash and
+/// download again whatever is missing, corrupted or modified.
+pub async fn repair(state: &AppState, id: Uuid, sink: &dyn LaunchSink) -> anyhow::Result<()> {
+    let instance = state.instances.get(id)?;
+    let settings = Settings::load(&state.root);
+    install::prepare(state, &instance, &settings, sink, true).await?;
+    Ok(())
+}
+
 /// Prepare and run an instance until the game exits or `stop` fires.
 /// Returns the game's exit code (`None` if it was stopped or killed).
 pub async fn run(
@@ -38,7 +47,7 @@ pub async fn run(
     let prepare = async {
         sink.status("auth", None);
         let auth = accounts::launch_auth(state, &settings).await?;
-        let prepared = install::prepare(state, &instance, &settings, sink).await?;
+        let prepared = install::prepare(state, &instance, &settings, sink, false).await?;
         anyhow::Ok((auth, prepared))
     };
     let (auth, prepared) = tokio::select! {
@@ -55,7 +64,17 @@ pub async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
-    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+        // Keeps background programs from stealing CPU time from the game.
+        let priority = if settings.optimize_game {
+            ABOVE_NORMAL_PRIORITY_CLASS
+        } else {
+            0
+        };
+        command.creation_flags(CREATE_NO_WINDOW | priority);
+    }
 
     let mut child = command
         .spawn()
@@ -170,6 +189,10 @@ fn launch_arguments(
         .unwrap_or(&settings.jvm_args);
 
     let mut args = vec![format!("-Xmx{memory}M")];
+    if settings.optimize_game {
+        args.extend(performance_jvm_args(memory, extra_jvm));
+    }
+    // After the tuning, so the user's own arguments win.
     args.extend(extra_jvm.split_whitespace().map(str::to_string));
     // Defence in depth against Log4Shell on 1.17–1.18; older versions rely
     // on Mojang's patched logging configuration below.
@@ -188,6 +211,50 @@ fn launch_arguments(
         ]);
     }
     Ok(args)
+}
+
+/// JVM tuning for the game client, skipping whatever the user set themselves.
+///
+/// The garbage collector settings are the ones the official launcher uses:
+/// G1 with a larger young generation and big regions, which keeps collections
+/// short and avoids "humongous" allocations for chunk and texture data.
+fn performance_jvm_args(memory_mb: u32, user_args: &str) -> Vec<String> {
+    let user: Vec<&str> = user_args.split_whitespace().collect();
+    let mut args = Vec::new();
+
+    if !user.iter().any(|arg| arg.starts_with("-Xms")) {
+        // Commit half the heap up front (at least 1 GiB) instead of growing it
+        // from the JVM default through a series of early collections.
+        let initial = (memory_mb / 2).max(1024).min(memory_mb);
+        args.push(format!("-Xms{initial}M"));
+    }
+
+    let picks_collector = user
+        .iter()
+        .any(|arg| arg.starts_with("-XX:+Use") && arg.ends_with("GC"));
+    if !picks_collector {
+        args.extend(
+            [
+                "-XX:+UnlockExperimentalVMOptions",
+                "-XX:+UseG1GC",
+                "-XX:G1NewSizePercent=20",
+                "-XX:G1ReservePercent=20",
+                "-XX:MaxGCPauseMillis=50",
+            ]
+            .map(str::to_string),
+        );
+        // Regions must stay small relative to the heap: G1 needs plenty of them.
+        let region_mb = match memory_mb {
+            4096.. => Some(32),
+            2048.. => Some(16),
+            1024.. => Some(8),
+            _ => None,
+        };
+        if let Some(region_mb) = region_mb {
+            args.push(format!("-XX:G1HeapRegionSize={region_mb}M"));
+        }
+    }
+    args
 }
 
 async fn pump_output<R: AsyncRead + Unpin>(reader: Option<R>, secret: &str, sink: &dyn LaunchSink) {
@@ -344,6 +411,9 @@ mod tests {
         let args = launch_arguments(&instance, &settings, &auth, &prepared).unwrap();
 
         assert_eq!(args[0], "-Xmx4096M");
+        assert_eq!(args[1], "-Xms2048M");
+        assert!(args.contains(&"-XX:+UseG1GC".to_string()));
+        assert!(args.contains(&"-XX:G1HeapRegionSize=32M".to_string()));
         assert!(args.iter().all(|arg| !arg.contains("${")), "{args:?}");
 
         let main = args.iter().position(|a| a == "net.minecraft.client.main.Main").unwrap();
@@ -375,8 +445,25 @@ mod tests {
             java_path: None,
         };
         let args = launch_arguments(&instance, &settings, &auth, &prepared).unwrap();
-        assert_eq!(&args[..3], ["-Xmx8192M", "-XX:+UseZGC", "-Dfoo=bar"]);
+        // The user chose a collector: only the initial heap is added.
+        assert_eq!(&args[..4], ["-Xmx8192M", "-Xms4096M", "-XX:+UseZGC", "-Dfoo=bar"]);
         assert!(!args.contains(&"-XX:+UseG1GC".to_string()));
         assert!(args.windows(4).any(|w| w == ["--width", "1280", "--height", "720"]));
+    }
+
+    #[test]
+    fn performance_arguments_respect_user_choices() {
+        assert_eq!(performance_jvm_args(512, "")[0], "-Xms512M");
+        assert_eq!(performance_jvm_args(2048, "")[0], "-Xms1024M");
+        assert!(performance_jvm_args(2048, "").contains(&"-XX:G1HeapRegionSize=16M".to_string()));
+        assert!(!performance_jvm_args(512, "")
+            .iter()
+            .any(|a| a.contains("G1HeapRegionSize")));
+        assert!(performance_jvm_args(4096, "-Xms512M -XX:+UseShenandoahGC").is_empty());
+
+        let (instance, mut settings, auth, prepared) = sample();
+        settings.optimize_game = false;
+        let args = launch_arguments(&instance, &settings, &auth, &prepared).unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("-Xms") || a.contains("G1")));
     }
 }
