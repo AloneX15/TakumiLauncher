@@ -148,7 +148,7 @@
 
 <div class="page">
   <header class="row">
-    <button on:click={() => dispatch('back')}>← Volver</button>
+    <button data-sound="close" on:click={() => dispatch('back')}>← Volver</button>
     <div class="heading">
       <h1>{instance.name}</h1>
       <p class="muted small">

@@ -123,7 +123,7 @@
 
   <svelte:fragment slot="footer">
     <div class="spacer" />
-    <button on:click={() => dispatch('close')}>Cancelar</button>
+    <button data-sound="off" on:click={() => dispatch('close')}>Cancelar</button>
     <button class="primary" disabled={!canCreate} on:click={create}>
       {creating ? 'Creando…' : 'Crear instancia'}
     </button>

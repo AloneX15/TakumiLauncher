@@ -187,6 +187,9 @@ pub fn delete_instance(state: AppStateRef<'_>, id: Uuid) -> CmdResult<()> {
 
 #[tauri::command]
 pub fn open_instance_folder(state: AppStateRef<'_>, id: Uuid) -> CmdResult<()> {
+    if state.instances.get(id).is_ok_and(|instance| instance.managed.is_some()) {
+        return Err("Las instancias privadas no tienen carpeta accesible desde el launcher.".into());
+    }
     let dir = state.instances.game_dir(id);
     if !dir.is_dir() {
         return Err("La carpeta de la instancia no existe.".into());
@@ -198,29 +201,17 @@ pub fn open_instance_folder(state: AppStateRef<'_>, id: Uuid) -> CmdResult<()> {
 
 #[tauri::command]
 pub fn list_accounts(state: AppStateRef<'_>) -> Accounts {
-    Accounts::load(&state.root)
-}
-
-#[tauri::command]
-pub fn add_offline_account(state: AppStateRef<'_>, username: String) -> CmdResult<Accounts> {
-    let mut accounts = Accounts::load(&state.root);
-    accounts.upsert(accounts::offline_account(&username).map_err(fail)?);
-    accounts.save(&state.root).map_err(fail)?;
-    Ok(accounts)
+    accounts::current(&state)
 }
 
 #[tauri::command]
 pub fn remove_account(state: AppStateRef<'_>, id: String) -> CmdResult<Accounts> {
-    accounts::remove_account(&state, &id).map_err(fail)?;
-    Ok(Accounts::load(&state.root))
+    accounts::remove_account(&state, &id).map_err(fail)
 }
 
 #[tauri::command]
 pub fn set_active_account(state: AppStateRef<'_>, id: String) -> CmdResult<Accounts> {
-    let mut accounts = Accounts::load(&state.root);
-    accounts.set_active(&id).map_err(fail)?;
-    accounts.save(&state.root).map_err(fail)?;
-    Ok(accounts)
+    accounts::set_active(&state, &id).map_err(fail)
 }
 
 /// Start the Microsoft device code flow. Returns the code to show the user;
@@ -243,7 +234,7 @@ pub async fn start_microsoft_login(app: AppHandle, state: AppStateRef<'_>) -> Cm
             Err(error) => Err(fail(error)),
         };
         let _ = match result {
-            Ok(_) => app.emit_all("auth-done", Accounts::load(&state.root)),
+            Ok(_) => app.emit_all("auth-done", accounts::current(&state)),
             Err(error) => app.emit_all("auth-error", error),
         };
     });
@@ -307,6 +298,11 @@ impl LaunchSink for EventSink {
             .app
             .emit_all("launch-log", json!({ "instance_id": self.id, "line": line }));
     }
+
+    fn private_update(&self, mut payload: serde_json::Value) {
+        payload["instance_id"] = json!(self.id);
+        let _ = self.app.emit_all("private-update", payload);
+    }
 }
 
 /// Prepare and start an instance in the background. Progress, game output
@@ -369,6 +365,39 @@ pub async fn repair_instance(app: AppHandle, state: AppStateRef<'_>, id: Uuid) -
     // Clears the progress shown on the instance card.
     let _ = app.emit_all("launch-exit", json!({ "instance_id": id, "code": null, "error": null }));
     result.map_err(fail)
+}
+
+/// Download (first time) or update a private instance without starting the game. Uses the same
+/// progress events as a launch.
+#[tauri::command]
+pub async fn sync_private_instance(app: AppHandle, state: AppStateRef<'_>, id: Uuid) -> CmdResult<Instance> {
+    let state = state.inner().clone();
+    {
+        let mut running = state.running.lock().unwrap();
+        if running.contains_key(&id) {
+            return Err("Esta instancia está en uso. Ciérrala antes de actualizarla.".into());
+        }
+        running.insert(id, None);
+    }
+    let sink = EventSink { app: app.clone(), id };
+    let result = crate::private_instances::sync(&state, id, &sink).await;
+    state.running.lock().unwrap().remove(&id);
+    let _ = app.emit_all("launch-exit", json!({ "instance_id": id, "code": null, "error": null }));
+    result.map(|synced| synced.instance).map_err(fail)
+}
+
+/// "Reiniciar y actualizar": asks the running game of a private instance to close (the Takumi Gate mod
+/// does it cleanly; otherwise the launcher closes it after a few seconds) and starts it again updated.
+#[tauri::command]
+pub fn restart_private_instance(state: AppStateRef<'_>, id: Uuid) -> CmdResult<()> {
+    if !state.running.lock().unwrap().contains_key(&id) {
+        return Err("La instancia no está en ejecución.".into());
+    }
+    let instance = state.instances.get(id).map_err(fail)?;
+    if instance.managed.is_none() {
+        return Err("Solo las instancias privadas se reinician para actualizar.".into());
+    }
+    crate::private_runtime::request_restart(&state.instances.game_dir(id)).map_err(fail)
 }
 
 #[tauri::command]

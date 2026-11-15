@@ -2,6 +2,8 @@
   import { invoke, openExternal } from '../lib/api.js';
   import { appInfo, attempt, session, toast } from '../lib/stores.js';
   import Logo from '../components/Logo.svelte';
+  import SoundToggle from '../components/SoundToggle.svelte';
+  import ConnectionStatus from '../components/ConnectionStatus.svelte';
 
   let user = '';
   let password = '';
@@ -26,6 +28,7 @@
 </script>
 
 <div class="screen">
+  <div class="sound"><ConnectionStatus /><SoundToggle /></div>
   <div class="card panel">
     <div class="brand">
       <Logo size={44} />
@@ -69,6 +72,8 @@
 
 <style>
   .screen {
+    position: relative;
+    overflow-y: auto;
     height: 100%;
     display: flex;
     flex-direction: column;
@@ -81,8 +86,29 @@
 
   .panel {
     width: 100%;
-    max-width: 380px;
-    padding: 28px;
+    max-width: 410px;
+    padding: 34px;
+    border-top: 2px solid var(--accent);
+    box-shadow:
+      0 24px 80px rgba(0, 0, 0, 0.35),
+      0 0 70px var(--accent-soft);
+    animation: panel-enter 500ms var(--ease-out);
+  }
+  .sound {
+    width: 184px;
+    position: absolute;
+    top: 20px;
+    right: 24px;
+  }
+  @keyframes panel-enter {
+    from {
+      opacity: 0;
+      transform: translateY(14px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 
   .brand {

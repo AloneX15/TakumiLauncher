@@ -88,10 +88,17 @@
     {/if}
   </p>
 
-  <label class="field">
-    <span>Nombre</span>
-    <input bind:value={name} maxlength="64" />
-  </label>
+  {#if instance.managed}
+    <p class="muted small">
+      Instancia privada: el organizador gestiona su nombre y sus archivos desde la web de Takumi. Aquí solo puedes
+      cambiar cómo se ejecuta en tu equipo.
+    </p>
+  {:else}
+    <label class="field">
+      <span>Nombre</span>
+      <input bind:value={name} maxlength="64" />
+    </label>
+  {/if}
 
   <label class="field">
     <span>Memoria máxima (MB)</span>
@@ -120,10 +127,12 @@
   </label>
 
   <div class="row tools">
-    <button on:click={() => attempt(invoke('open_instance_folder', { id: instance.id }))}>Abrir carpeta</button>
-    <button disabled={busy || duplicating} on:click={duplicate}>
-      {duplicating ? 'Duplicando…' : 'Duplicar instancia'}
-    </button>
+    {#if !instance.managed}
+      <button on:click={() => attempt(invoke('open_instance_folder', { id: instance.id }))}>Abrir carpeta</button>
+      <button disabled={busy || duplicating} on:click={duplicate}>
+        {duplicating ? 'Duplicando…' : 'Duplicar instancia'}
+      </button>
+    {/if}
     <button
       disabled={busy || repairing}
       title="Comprueba el hash de cada archivo del juego y vuelve a descargar los que estén dañados o modificados"
@@ -148,7 +157,7 @@
       </button>
     {/if}
     <div class="spacer" />
-    <button on:click={() => dispatch('close')}>Cancelar</button>
+    <button data-sound="off" on:click={() => dispatch('close')}>Cancelar</button>
     <button class="primary" disabled={saving || !name.trim()} on:click={save}>Guardar</button>
   </svelte:fragment>
 </Modal>

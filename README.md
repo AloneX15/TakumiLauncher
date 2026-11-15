@@ -21,7 +21,9 @@ The desktop launcher is functional:
 - Duplicate instances with their worlds and mods
 - Parallel, SHA-1 verified downloads of client, libraries and assets with progress
 - Automatic Java: the exact runtime each version needs is installed from Mojang's distribution
-- Microsoft accounts (device code flow, refresh token kept in the OS credential store) and offline profiles
+- Microsoft accounts (device code flow, refresh token kept in the OS credential store), which take priority, and one
+  offline profile that is always the Takumi account's username (with the vanilla offline-mode UUID); players cannot
+  make up offline names (`apps/launcher/src-tauri/src/accounts.rs`)
 - Live game console, stop/cancel, per-instance folder access
 - Mandatory **Takumi account** sign-in, a news tab and a new-version notice, all served by the
   [TakumiWeb](https://github.com/AloneX15/TakumiWeb) website (see below)
@@ -229,6 +231,7 @@ cargo tauri build
 
 ## 📚 Documentation
 
+- [UI experience](docs/UI_EXPERIENCE.md) - Visual improvements, motion, sound preferences and validation (Spanish)
 - [Architecture](docs/ARCHITECTURE.md) - System design and components
 - [API](docs/API.md) - Backend API specification
 - [Manifest System](docs/MANIFEST.md) - Instance manifest format

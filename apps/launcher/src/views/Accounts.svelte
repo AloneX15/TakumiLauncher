@@ -1,15 +1,15 @@
 <script>
   import { createEventDispatcher } from 'svelte';
   import { invoke, openExternal } from '../lib/api.js';
-  import { accounts, attempt, deviceCode, settingsView, toast } from '../lib/stores.js';
+  import { accounts, attempt, deviceCode, session, settingsView, toast } from '../lib/stores.js';
 
   const dispatch = createEventDispatcher();
 
-  let offlineName = '';
   let startingLogin = false;
   let confirmingRemoval = null;
 
   $: microsoftAvailable = $settingsView?.microsoft_login_available ?? false;
+  $: hasMicrosoft = $accounts.accounts.some((a) => a.kind === 'microsoft');
 
   async function apply(promise) {
     const updated = await attempt(promise);
@@ -41,10 +41,6 @@
     }
   }
 
-  async function addOffline() {
-    if (await apply(invoke('add_offline_account', { username: offlineName }))) offlineName = '';
-  }
-
   async function remove(id) {
     confirmingRemoval = null;
     await apply(invoke('remove_account', { id }));
@@ -53,7 +49,10 @@
 
 <header>
   <h1>Cuentas</h1>
-  <p class="muted">La cuenta seleccionada es la que se usa al jugar.</p>
+  <p class="muted">
+    La cuenta seleccionada es la que se usa al jugar. Si tienes una cuenta de Microsoft con Minecraft, se usa esa por
+    defecto.
+  </p>
 </header>
 
 {#if $accounts.accounts.length > 0}
@@ -70,11 +69,15 @@
           <div class="avatar">{account.username[0].toUpperCase()}</div>
           <div>
             <div class="username">{account.username}</div>
-            <div class="muted small">{account.kind === 'microsoft' ? 'Cuenta de Microsoft' : 'Perfil sin conexión'}</div>
+            <div class="muted small">
+              {account.kind === 'microsoft' ? 'Cuenta de Microsoft (premium)' : 'Sin conexión · tu usuario de Takumi'}
+            </div>
           </div>
         </label>
         <div class="spacer" />
-        {#if confirmingRemoval === account.id}
+        {#if account.kind !== 'microsoft'}
+          <span class="muted small">Automático</span>
+        {:else if confirmingRemoval === account.id}
           <button class="danger" on:click={() => remove(account.id)}>Confirmar</button>
           <button on:click={() => (confirmingRemoval = null)}>Cancelar</button>
         {:else}
@@ -113,12 +116,12 @@
 <section class="card">
   <h2>Perfil sin conexión</h2>
   <p class="muted">
-    Sirve para un jugador y para servidores sin verificación de cuentas. No permite entrar en servidores en línea.
+    Si no tienes cuenta premium, juegas con tu usuario de Takumi
+    {#if $session}<strong class="selectable">{$session.username}</strong>{/if}. Sirve para un jugador y para servidores
+    sin verificación de cuentas, no para servidores en línea.
+    {#if hasMicrosoft}Ahora mismo tiene prioridad tu cuenta de Microsoft.{/if}
   </p>
-  <form class="row" on:submit|preventDefault={addOffline}>
-    <input bind:value={offlineName} maxlength="16" placeholder="Nombre de jugador" spellcheck="false" />
-    <button disabled={offlineName.trim().length < 3}>Añadir</button>
-  </form>
+  <p class="muted small">El nombre es el de tu cuenta de Takumi Web y no se puede cambiar desde el launcher.</p>
 </section>
 
 <style>
@@ -179,9 +182,5 @@
     background: var(--bg);
     border: 1px dashed var(--border);
     border-radius: var(--radius);
-  }
-
-  form input {
-    max-width: 280px;
   }
 </style>

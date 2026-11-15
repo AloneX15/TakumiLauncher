@@ -11,9 +11,12 @@ mod forge;
 mod install;
 mod launch;
 mod modpack;
+mod private_instances;
+mod private_runtime;
 mod session;
 mod settings;
 mod state;
+mod web_connection;
 
 #[cfg(test)]
 mod e2e;
@@ -40,7 +43,10 @@ fn main() {
                 app.package_info().version,
                 root.display()
             );
-            app.manage(Arc::new(AppState::new(root)?));
+            let state = Arc::new(AppState::new(root)?);
+            // Event files a crash left decrypted in a private instance.
+            private_runtime::scrub_all(&state);
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -54,7 +60,6 @@ fn main() {
             commands::delete_instance,
             commands::open_instance_folder,
             commands::list_accounts,
-            commands::add_offline_account,
             commands::remove_account,
             commands::set_active_account,
             commands::start_microsoft_login,
@@ -65,11 +70,16 @@ fn main() {
             commands::stop_instance,
             commands::repair_instance,
             commands::running_instances,
+            commands::sync_private_instance,
+            private_instances::list_private_instances,
+            private_instances::join_private_instance,
+            commands::restart_private_instance,
             session::get_session,
             session::takumi_login,
             session::takumi_logout,
             session::get_news,
             session::check_launcher_update,
+            web_connection::check_web_connection,
             content_commands::search_content,
             content_commands::list_content,
             content_commands::install_content,

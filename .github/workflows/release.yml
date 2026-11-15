@@ -7,6 +7,7 @@ name: Release
 # Repository secrets needed to publish on the website (Settings → Secrets → Actions):
 #   TAKUMI_WEB_URL        e.g. https://takumilabs.org
 #   TAKUMI_RELEASE_TOKEN  same value as RELEASE_API_TOKEN on the web server
+#   TAKUMI_MANIFEST_PUBKEY  public key of MANIFEST_SIGNING_KEY (GET /api/launcher/manifest-key)
 # Without them the GitHub release is still created; only the website step is skipped.
 
 on:
@@ -67,6 +68,9 @@ jobs:
         env:
           # Baked into the binary; without it the launcher talks to http://localhost:5173.
           TAKUMI_WEB_URL: ${{ secrets.TAKUMI_WEB_URL || 'https://takumilabs.org' }}
+          # Public key that verifies private instance manifests (GET /api/launcher/manifest-key on the web).
+          # Without it release builds refuse to play private instances.
+          TAKUMI_MANIFEST_PUBKEY: ${{ secrets.TAKUMI_MANIFEST_PUBKEY }}
         run: tauri build --bundles nsis
 
       - name: Create GitHub release

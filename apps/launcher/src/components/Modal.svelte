@@ -1,10 +1,12 @@
 <script>
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onDestroy } from 'svelte';
+  import { playCloseSound } from '../lib/experience.js';
 
   export let title;
 
   const dispatch = createEventDispatcher();
   const close = () => dispatch('close');
+  onDestroy(playCloseSound);
 </script>
 
 <svelte:window on:keydown={(e) => e.key === 'Escape' && close()} />
@@ -14,7 +16,7 @@
   <div class="dialog" role="dialog" aria-modal="true" aria-label={title}>
     <header>
       <h2>{title}</h2>
-      <button class="ghost close" on:click={close} aria-label="Cerrar">✕</button>
+      <button class="ghost close" data-sound="off" on:click={close} aria-label="Cerrar">✕</button>
     </header>
     <div class="body">
       <slot />
@@ -34,6 +36,8 @@
     place-items: center;
     z-index: 50;
     padding: 24px;
+    backdrop-filter: blur(6px);
+    animation: backdrop-enter 180ms ease-out;
   }
 
   .dialog {
@@ -45,6 +49,25 @@
     border: 1px solid var(--border);
     border-radius: 14px;
     box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+    animation: dialog-enter 250ms var(--ease-out);
+  }
+  @keyframes backdrop-enter {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes dialog-enter {
+    from {
+      opacity: 0;
+      transform: translateY(12px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
   }
 
   header {

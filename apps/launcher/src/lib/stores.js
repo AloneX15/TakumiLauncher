@@ -41,9 +41,60 @@ export async function attempt(promise) {
   }
 }
 
+/** The offline profile follows the Takumi account, so the list changes with the session. */
+export async function refreshAccounts() {
+  const list = await attempt(invoke('list_accounts'));
+  if (list) accounts.set(list);
+}
+
 export async function refreshInstances() {
   const list = await attempt(invoke('list_instances'));
   if (list) instances.set(list);
+  refreshPrivate();
+}
+
+/**
+ * Private (event) instances of the signed-in Takumi user, from the website:
+ * `{ list, error }`. `list` is null until loaded; on error the last list is kept.
+ */
+export const privateInstances = writable({ list: null, error: null });
+
+export async function refreshPrivate() {
+  try {
+    const list = await invoke('list_private_instances');
+    privateInstances.set({ list, error: null });
+  } catch (error) {
+    privateInstances.update((current) => ({ ...current, error: String(error) }));
+  }
+}
+
+/**
+ * Mandatory updates published while a private instance is running:
+ * instance id -> `{ version, grace_minutes, deadline, notes }`. Cleared when the game exits.
+ */
+export const privateUpdates = writable({});
+
+/** Close the running game of a private instance and start it again, updated. */
+export async function restartPrivate(id) {
+  try {
+    await invoke('restart_private_instance', { id });
+    toast('Cerrando el juego para actualizar…', 'info');
+  } catch (error) {
+    toast(error, 'error');
+  }
+}
+
+/** Download or update a private instance without starting it. */
+export async function syncPrivate(id) {
+  launches.update((all) => ({ ...all, [id]: { stage: 'sync', progress: null } }));
+  try {
+    await invoke('sync_private_instance', { id });
+    toast('Instancia privada al día.', 'success');
+  } catch (error) {
+    endLaunch(id);
+    toast(error, 'error');
+  }
+  await refreshInstances();
 }
 
 export async function launch(id) {
@@ -107,8 +158,17 @@ export async function init() {
       launches.update((all) => ({ ...all, [instance_id]: { stage, progress } }));
     }),
     listen('launch-log', ({ instance_id, line }) => queueLine(instance_id, line)),
+    listen('private-update', (update) => {
+      privateUpdates.update((all) => ({ ...all, [update.instance_id]: update }));
+      toast(
+        `${instanceName(update.instance_id)}: hay una actualización obligatoria. Reinicia el juego para evitar errores.`,
+        'error',
+      );
+      refreshPrivate();
+    }),
     listen('launch-exit', ({ instance_id, code, error }) => {
       endLaunch(instance_id);
+      privateUpdates.update(({ [instance_id]: _, ...rest }) => rest);
       if (error) {
         queueLine(instance_id, `[Launcher] ${error}`);
         toast(error, 'error');
@@ -124,7 +184,10 @@ export async function init() {
       toast('Sesión iniciada correctamente.', 'success');
     }),
     // The session is shown from cache at start-up and checked in the background.
-    listen('session-changed', (updated) => session.set(updated)),
+    listen('session-changed', (updated) => {
+      session.set(updated);
+      refreshPrivate();
+    }),
     listen('session-ended', () => {
       session.set(null);
       toast('Tu sesión de Takumi ha caducado o se ha cerrado. Vuelve a iniciar sesión.', 'error');
@@ -159,4 +222,13 @@ export async function init() {
       return next;
     });
   }
+  // Sign-in, sign-out and a renamed Takumi account all change the offline profile.
+  let lastUser = current?.username ?? null;
+  session.subscribe((value) => {
+    const user = value?.username ?? null;
+    if (user !== lastUser) {
+      lastUser = user;
+      refreshAccounts();
+    }
+  });
 }

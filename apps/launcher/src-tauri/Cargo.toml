@@ -18,6 +18,8 @@ anyhow.workspace = true
 uuid = { workspace = true }
 chrono = { workspace = true }
 zip.workspace = true
+base64 = "0.22"
+md5 = { package = "md-5", version = "0.10" }
 
 # Shared libraries
 types.workspace = true
@@ -25,6 +27,7 @@ auth-system.workspace = true
 download-manager.workspace = true
 minecraft-resolver.workspace = true
 instance-manager.workspace = true
+manifest-system.workspace = true
 telemetry.workspace = true
 
 [features]

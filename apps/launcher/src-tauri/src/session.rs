@@ -21,7 +21,7 @@ const VAULT_KEY: &str = "takumi-session";
 /// `TAKUMI_WEB_URL` at compile time (see .github/workflows/release.yml).
 const LOCAL_WEB_URL: &str = "http://localhost:5173";
 const BUILD_WEB_URL: Option<&str> = option_env!("TAKUMI_WEB_URL");
-const TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(15);
 const UNREACHABLE: &str = "No se pudo conectar con el servidor de Takumi. Comprueba tu conexión a internet.";
 const UNREACHABLE_LOCAL: &str =
     "No se pudo conectar con la web de Takumi en local. Arráncala con «pnpm dev» en la carpeta takumi-webpage.";
@@ -53,7 +53,7 @@ fn is_secure_web_url(url: &str) -> bool {
 }
 
 /// Connection error message, with a hint to start the web when it is local.
-fn unreachable() -> &'static str {
+pub(crate) fn unreachable() -> &'static str {
     let url = web_url();
     if url.contains("://localhost") || url.contains("://127.0.0.1") {
         UNREACHABLE_LOCAL
@@ -62,7 +62,7 @@ fn unreachable() -> &'static str {
     }
 }
 
-fn endpoint(path: &str) -> String {
+pub(crate) fn endpoint(path: &str) -> String {
     format!("{}{path}", web_url())
 }
 
@@ -132,7 +132,7 @@ struct ApiError {
 }
 
 /// Turn a non-success response into the server's `{ "error": "…" }` message.
-async fn api_error(response: reqwest::Response) -> anyhow::Error {
+pub(crate) async fn api_error(response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
     match response.json::<ApiError>().await {
         Ok(body) => anyhow!(body.error),
@@ -246,6 +246,20 @@ async fn logout(state: &AppState) -> anyhow::Result<()> {
 fn forget(state: &AppState) -> anyhow::Result<()> {
     state.vault.delete(VAULT_KEY)?;
     TakumiSession::clear(&state.root)
+}
+
+/// The stored API token for calls that need the signed-in Takumi user.
+pub(crate) fn api_token(state: &AppState) -> anyhow::Result<String> {
+    state
+        .vault
+        .load(VAULT_KEY)?
+        .ok_or_else(|| anyhow!("Inicia sesión con tu cuenta Takumi para usar las instancias privadas."))
+}
+
+/// Whether the configured website is a local development server.
+pub(crate) fn is_local_web() -> bool {
+    let url = web_url();
+    url.contains("://localhost") || url.contains("://127.0.0.1") || url.contains("://[::1]")
 }
 
 /// Returns the stored session at once and checks it with the server in the

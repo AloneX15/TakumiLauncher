@@ -40,7 +40,7 @@ pub async fn install_content(
     kind: ContentKind,
     project: String,
 ) -> CmdResult<Vec<String>> {
-    let instance = state.instances.get(id).map_err(fail)?;
+    let instance = editable(&state, id)?;
     content::install_project(&state, &instance, kind, &project)
         .await
         .map_err(fail)
@@ -49,7 +49,7 @@ pub async fn install_content(
 /// Install the client performance mods (Sodium, Lithium…) the instance is missing.
 #[tauri::command]
 pub async fn optimize_instance(state: AppStateRef<'_>, id: Uuid) -> CmdResult<content::OptimizeReport> {
-    let instance = state.instances.get(id).map_err(fail)?;
+    let instance = editable(&state, id)?;
     content::install_performance_mods(&state, &instance).await.map_err(fail)
 }
 
@@ -61,13 +61,13 @@ pub fn set_content_enabled(
     filename: String,
     enabled: bool,
 ) -> CmdResult<()> {
-    let instance = state.instances.get(id).map_err(fail)?;
+    let instance = editable(&state, id)?;
     content::set_enabled(&state, &instance, kind, &filename, enabled).map_err(fail)
 }
 
 #[tauri::command]
 pub fn remove_content(state: AppStateRef<'_>, id: Uuid, kind: ContentKind, filename: String) -> CmdResult<()> {
-    let instance = state.instances.get(id).map_err(fail)?;
+    let instance = editable(&state, id)?;
     content::remove(&state, &instance, kind, &filename).map_err(fail)
 }
 
@@ -79,7 +79,7 @@ pub async fn check_content_updates(state: AppStateRef<'_>, id: Uuid) -> CmdResul
 
 #[tauri::command]
 pub async fn update_content(state: AppStateRef<'_>, id: Uuid, kind: ContentKind, filename: String) -> CmdResult<()> {
-    let instance = state.instances.get(id).map_err(fail)?;
+    let instance = editable(&state, id)?;
     content::update(&state, &instance, kind, &filename).await.map_err(fail)
 }
 
@@ -126,9 +126,17 @@ pub async fn duplicate_instance(state: AppStateRef<'_>, id: Uuid) -> CmdResult<I
     if state.running.lock().unwrap().contains_key(&id) {
         return Err("Detén el juego antes de duplicar la instancia.".into());
     }
+    editable(&state, id)?;
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || state.instances.duplicate(id))
         .await
         .map_err(fail)?
         .map_err(fail)
+}
+
+/// The instance, unless it is a private instance managed from the website.
+fn editable(state: &AppStateRef<'_>, id: Uuid) -> CmdResult<Instance> {
+    let instance = state.instances.get(id).map_err(fail)?;
+    crate::private_instances::ensure_editable(&instance).map_err(fail)?;
+    Ok(instance)
 }

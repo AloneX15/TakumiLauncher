@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub use types::{Instance, InstanceSettings, ModLoader};
+pub use types::{Instance, InstanceSettings, ManagedSource, ModLoader};
 
 const METADATA_FILE: &str = "instance.json";
 const MAX_NAME_LEN: usize = 64;
@@ -99,9 +99,20 @@ impl InstanceStore {
     }
 
     pub fn create(&self, new: NewInstance) -> InstanceResult<Instance> {
+        self.create_with_id(Uuid::new_v4(), new, None)
+    }
+
+    /// Create an instance with a fixed id. Private instances use the website's id, so each one maps to
+    /// exactly one folder.
+    pub fn create_with_id(
+        &self,
+        id: Uuid,
+        new: NewInstance,
+        managed: Option<ManagedSource>,
+    ) -> InstanceResult<Instance> {
         let now = Utc::now();
         let instance = Instance {
-            id: Uuid::new_v4(),
+            id,
             name: validate_name(&new.name)?,
             description: None,
             minecraft_version: new.minecraft_version,
@@ -111,6 +122,7 @@ impl InstanceStore {
             updated_at: now,
             last_played: None,
             settings: InstanceSettings::default(),
+            managed,
         };
         std::fs::create_dir_all(self.game_dir(instance.id))?;
         self.write(&instance)?;
@@ -137,6 +149,8 @@ impl InstanceStore {
             created_at: now,
             updated_at: now,
             last_played: None,
+            // A copy is an ordinary instance the player can modify.
+            managed: None,
             ..source
         };
         let target = self.instance_dir(copy.id);

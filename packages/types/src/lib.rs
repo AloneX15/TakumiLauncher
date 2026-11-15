@@ -24,6 +24,22 @@ pub struct Instance {
     pub last_played: Option<DateTime<Utc>>,
     #[serde(default)]
     pub settings: InstanceSettings,
+    /// Set for private instances managed from the Takumi website: their files come from a signed
+    /// manifest and cannot be changed in the launcher. The instance id is the website's instance id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedSource>,
+}
+
+/// What the launcher last installed of a private instance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagedSource {
+    /// Published manifest version on disk (0 = never synchronised).
+    pub version: u32,
+    /// Server the game joins directly (`host` or `host:port`).
+    pub server: Option<String>,
+    /// Folders where files that are not in the manifest are removed.
+    pub locked_dirs: Vec<String>,
 }
 
 /// Per-instance overrides; `None` falls back to the global settings.

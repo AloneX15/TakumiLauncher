@@ -121,6 +121,18 @@ pub struct DownloadJob {
     /// Re-hash a file that is already on disk instead of trusting its size
     /// ("repair": finds corrupted or modified files).
     pub verify_existing: bool,
+    /// `Authorization: Bearer …` for files that need a signed-in user (private instances).
+    pub bearer: Option<BearerToken>,
+}
+
+/// An API token that never shows up in `Debug` output or logs.
+#[derive(Clone)]
+pub struct BearerToken(pub String);
+
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BearerToken(****)")
+    }
 }
 
 impl DownloadJob {
@@ -131,7 +143,18 @@ impl DownloadJob {
             checksum: None,
             size: None,
             verify_existing: false,
+            bearer: None,
         }
+    }
+
+    pub fn sha256(mut self, hash: impl Into<String>) -> Self {
+        self.checksum = Some(Checksum::Sha256(hash.into()));
+        self
+    }
+
+    pub fn bearer(mut self, token: impl Into<String>) -> Self {
+        self.bearer = Some(BearerToken(token.into()));
+        self
     }
 
     pub fn verify_existing(mut self, verify: bool) -> Self {
@@ -351,7 +374,11 @@ impl Downloader {
     async fn fetch(&self, job: &DownloadJob, tracker: &Tracker<'_>, counted: &mut u64) -> DownloadResult<()> {
         let net = |e: reqwest::Error| DownloadError::NetworkError(format!("{}: {e}", job.url));
 
-        let mut response = self.client.get(&job.url).send().await.map_err(net)?;
+        let mut request = self.client.get(&job.url);
+        if let Some(BearerToken(token)) = &job.bearer {
+            request = request.bearer_auth(token);
+        }
+        let mut response = request.send().await.map_err(net)?;
         if !response.status().is_success() {
             return Err(DownloadError::DownloadFailed(format!(
                 "{} respondió HTTP {}",

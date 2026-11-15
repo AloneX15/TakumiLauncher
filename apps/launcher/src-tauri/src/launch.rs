@@ -2,12 +2,16 @@
 
 use crate::accounts::{self, LaunchAuth};
 use crate::install::{self, Prepared};
+use crate::private_instances::{self, LiveOutcome, Synced};
+use crate::private_runtime::{self as runtime, MaterializeError, Materialized};
+use crate::session;
 use crate::settings::{Settings, MIN_MEMORY_MB};
 use crate::state::AppState;
 use anyhow::{bail, Context};
 use download_manager::DownloadProgress;
 use minecraft_resolver::{build_arguments, Env};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -22,6 +26,19 @@ pub const CANCELLED: &str = "Cancelado";
 pub trait LaunchSink: Send + Sync {
     fn status(&self, stage: &str, progress: Option<DownloadProgress>);
     fn log(&self, line: String);
+    /// A private instance published a version that needs a restart while the game runs.
+    fn private_update(&self, _payload: serde_json::Value) {}
+}
+
+/// Seconds between checks for a newer published version while a private instance runs.
+const LIVE_POLL_SECS: u64 = 30;
+/// A game that has not closed itself this long after a restart request is closed by the launcher.
+const RESTART_KILL_AFTER_SECS: u64 = 20;
+
+enum Exit {
+    Code(Option<i32>),
+    /// The game closed to update: start it again.
+    Restart,
 }
 
 /// Re-check every file the instance uses against its published hash and
@@ -35,14 +52,41 @@ pub async fn repair(state: &AppState, id: Uuid, sink: &dyn LaunchSink) -> anyhow
 
 /// Prepare and run an instance until the game exits or `stop` fires.
 /// Returns the game's exit code (`None` if it was stopped or killed).
+/// A private instance that closes to apply a mandatory update starts again, updated.
 pub async fn run(
     state: &AppState,
     id: Uuid,
     mut stop: oneshot::Receiver<()>,
     sink: &dyn LaunchSink,
 ) -> anyhow::Result<Option<i32>> {
+    loop {
+        match run_once(state, id, &mut stop, sink).await? {
+            Exit::Code(code) => return Ok(code),
+            Exit::Restart => sink.log("[Takumi] Reiniciando para aplicar la actualización obligatoria…".into()),
+        }
+    }
+}
+
+async fn run_once(
+    state: &AppState,
+    id: Uuid,
+    stop: &mut oneshot::Receiver<()>,
+    sink: &dyn LaunchSink,
+) -> anyhow::Result<Exit> {
     let mut instance = state.instances.get(id)?;
     let settings = Settings::load(&state.root);
+
+    // Private instances always update to the published version first: there is no playing an old one.
+    let private: Option<Synced> = if instance.managed.is_some() {
+        let synced = tokio::select! {
+            result = private_instances::sync(state, id, sink) => result?,
+            _ = &mut *stop => bail!(CANCELLED),
+        };
+        instance = synced.instance.clone();
+        Some(synced)
+    } else {
+        None
+    };
 
     let prepare = async {
         sink.status("auth", None);
@@ -52,8 +96,32 @@ pub async fn run(
     };
     let (auth, prepared) = tokio::select! {
         result = prepare => result?,
-        _ = &mut stop => bail!(CANCELLED),
+        _ = &mut *stop => bail!(CANCELLED),
     };
+
+    // Private instances: a join ticket for the event server, and the event files decrypted for this run.
+    let mut ticket = None;
+    let mut materialized = None;
+    let mut mark = String::new();
+    if let Some(synced) = &private {
+        let token = session::api_token(state)?;
+        let version = synced.manifest.version;
+        let request = runtime::request_ticket(state, id, &token, &auth.uuid, &auth.username, version);
+        ticket = Some(tokio::select! {
+            result = request => result.map_err(|e| e.context("No se pudo obtener el pase de entrada del evento"))?,
+            _ = &mut *stop => bail!(CANCELLED),
+        });
+        runtime::ensure_safe_signal_dir(&prepared.game_dir)?;
+        runtime::clear_signals(&prepared.game_dir);
+        let username = session::TakumiSession::load(&state.root)
+            .map(|s| s.username)
+            .unwrap_or_else(|| "desconocido".into());
+        mark = runtime::watermark(&username, &instance.name, id);
+        materialized = Some(tokio::select! {
+            result = materialize_with_retry(state, id, synced, &mark, sink) => result?,
+            _ = &mut *stop => bail!(CANCELLED),
+        });
+    }
 
     sink.status("starting", None);
     let mut command = Command::new(&prepared.java);
@@ -63,6 +131,12 @@ pub async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let (Some(ticket), Some(synced)) = (&ticket, &private) {
+        // Read by the Takumi Gate mod; never put on the command line, where other programs could see it.
+        command
+            .env("TAKUMI_GATE_TICKET", ticket)
+            .env("TAKUMI_INSTANCE_VERSION", synced.manifest.version.to_string());
+    }
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -97,21 +171,187 @@ pub async fn run(
     tokio::pin!(output);
     let mut output_done = false;
 
-    let code = loop {
-        tokio::select! {
-            status = child.wait() => break status?.code(),
-            _ = &mut output, if !output_done => output_done = true,
-            _ = &mut stop => {
-                child.kill().await?;
-                break None;
+    let (code, stopped) = {
+        let live = async {
+            match (&private, &materialized) {
+                (Some(synced), Some(running)) => {
+                    watch_live(state, id, synced, running, &mark, &prepared.game_dir, sink).await
+                }
+                _ => std::future::pending().await,
             }
-        }
+        };
+        tokio::pin!(live);
+
+        let mut stopped = false;
+        let code = loop {
+            tokio::select! {
+                status = child.wait() => break status?.code(),
+                _ = &mut output, if !output_done => output_done = true,
+                _ = &mut live => {
+                    // The player asked to restart and the game did not close by itself.
+                    child.kill().await?;
+                    break None;
+                }
+                _ = &mut *stop => {
+                    child.kill().await?;
+                    stopped = true;
+                    break None;
+                }
+            }
+        };
+        (code, stopped)
     };
     if !output_done {
         // Flush what the game wrote just before exiting.
         let _ = tokio::time::timeout(Duration::from_secs(2), output).await;
     }
-    Ok(code)
+    // Event files leave the game folder as soon as the game is gone.
+    drop(materialized);
+    if private.is_some() {
+        let restart = runtime::take_restart_request(&prepared.game_dir);
+        runtime::clear_signals(&prepared.game_dir);
+        if restart && !stopped {
+            return Ok(Exit::Restart);
+        }
+    }
+    Ok(Exit::Code(code))
+}
+
+/// Decrypts the event files; objects that fail (modified or from an old key) are downloaded again once.
+async fn materialize_with_retry(
+    state: &AppState,
+    id: Uuid,
+    synced: &Synced,
+    mark: &str,
+    sink: &dyn LaunchSink,
+) -> anyhow::Result<Materialized> {
+    let instance_dir = state.instances.instance_dir(id);
+    let game_dir = state.instances.game_dir(id);
+    for attempt in 0..2 {
+        let (dir, game, files, key, mark) = (
+            instance_dir.clone(),
+            game_dir.clone(),
+            synced.manifest.files.clone(),
+            synced.key.clone(),
+            mark.to_string(),
+        );
+        let result =
+            tokio::task::spawn_blocking(move || runtime::materialize(&dir, &game, &files, &key, &mark)).await?;
+        match result {
+            Ok(materialized) => return Ok(materialized),
+            Err(MaterializeError::Corrupt(list)) if attempt == 0 => {
+                sink.log(format!(
+                    "[Takumi] {} archivos de la instancia estaban dañados; se descargan de nuevo.",
+                    list.len()
+                ));
+                let token = session::api_token(state)?;
+                private_instances::download_and_seal(
+                    state,
+                    &synced.manifest.files,
+                    &instance_dir,
+                    &game_dir,
+                    id,
+                    &token,
+                    &synced.key,
+                    sink,
+                )
+                .await?;
+            }
+            Err(MaterializeError::Corrupt(_)) => {
+                bail!("Los archivos de la instancia siguen dañados tras descargarlos de nuevo.")
+            }
+            Err(MaterializeError::Other(error)) => return Err(error),
+        }
+    }
+    unreachable!("the loop returns on its second attempt")
+}
+
+/// Runs next to a private instance's game: applies resource-pack-only versions live, tells the game and
+/// the launcher window when a version needs a restart, and returns when a requested restart is overdue
+/// (the game did not close by itself).
+async fn watch_live(
+    state: &AppState,
+    id: Uuid,
+    synced: &Synced,
+    running: &Materialized,
+    mark: &str,
+    game_dir: &Path,
+    sink: &dyn LaunchSink,
+) {
+    let mut installed = synced.manifest.version;
+    let mut notified = installed;
+    let mut seconds = 0u64;
+    let mut locked = false;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        seconds += 1;
+        if runtime::restart_request_age(game_dir).is_some_and(|age| age >= RESTART_KILL_AFTER_SECS) {
+            return;
+        }
+        // The Takumi Gate mod says every jar is open: nobody else may read them while the game runs.
+        if !locked && runtime::signal_path(game_dir, runtime::LOADED_FILE).is_file() {
+            locked = true;
+            match runtime::lock_running(game_dir) {
+                Ok(_) => sink.log("[Takumi] Carpeta de mods bloqueada mientras juegas.".into()),
+                Err(error) => tracing::warn!("no se pudo bloquear la carpeta de mods: {error:#}"),
+            }
+        }
+        if seconds == 300 && !locked {
+            sink.log(
+                "[Takumi] Esta instancia no incluye Takumi Gate: la carpeta de mods no se puede bloquear mientras juegas."
+                    .into(),
+            );
+        }
+        if !seconds.is_multiple_of(LIVE_POLL_SECS) {
+            continue;
+        }
+        let Ok(token) = session::api_token(state) else { continue };
+        let status = match runtime::fetch_status(state, id, &token, installed).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::debug!("estado de la instancia privada no disponible: {error:#}");
+                continue;
+            }
+        };
+        if status.version <= notified {
+            continue;
+        }
+        notified = status.version;
+
+        if !status.restart_required {
+            match private_instances::live_apply(state, id, &token, &synced.key, mark, running, sink).await {
+                Ok((version, LiveOutcome::Applied { packs })) => {
+                    installed = version;
+                    let signal = serde_json::json!({ "version": version, "packs": packs });
+                    if let Err(error) = runtime::write_signal(game_dir, runtime::RELOAD_FILE, &signal) {
+                        tracing::warn!("no se pudo avisar al juego: {error:#}");
+                    }
+                    sink.log(format!(
+                        "[Takumi] Versión {version} aplicada en directo (packs de recursos)."
+                    ));
+                    continue;
+                }
+                Ok((_, LiveOutcome::NeedsRestart)) => {}
+                Err(error) => sink.log(format!("[Takumi] No se pudo aplicar la versión en directo: {error:#}")),
+            }
+        }
+
+        let deadline = chrono::Utc::now() + chrono::Duration::minutes(i64::from(status.grace_minutes));
+        let notice = serde_json::json!({
+            "version": status.version,
+            "grace_minutes": status.grace_minutes,
+            "deadline": deadline.to_rfc3339(),
+            "notes": status.notes,
+        });
+        if let Err(error) = runtime::write_signal(game_dir, runtime::NOTICE_FILE, &notice) {
+            tracing::warn!("no se pudo avisar al juego: {error:#}");
+        }
+        sink.private_update(notice);
+        sink.log(format!(
+            "[Takumi] Hay una actualización obligatoria (versión {}). Reinicia el juego para evitar errores.",
+            status.version
+        ));
+    }
 }
 
 /// Full argument list for the Java executable.
@@ -168,6 +408,12 @@ fn launch_arguments(
     .collect();
 
     let mut env = Env::current();
+    // Private instances join their event server directly (quick play, 1.20+).
+    let server = instance.managed.as_ref().and_then(|m| m.server.clone());
+    if let Some(server) = &server {
+        env = env.with_feature("is_quick_play_multiplayer", true);
+        vars.insert("quickPlayMultiplayer".into(), server.clone());
+    }
     let resolution = instance.settings.width.zip(instance.settings.height);
     if let Some((width, height)) = resolution {
         env = env.with_feature("has_custom_resolution", true);
@@ -200,7 +446,16 @@ fn launch_arguments(
     args.extend(prepared.logging_argument.clone());
     args.extend(arguments.jvm);
     args.push(main_class);
+    let quick_play = arguments.game.iter().any(|arg| arg == "--quickPlayMultiplayer");
     args.extend(arguments.game);
+    if let (Some(server), false) = (&server, quick_play) {
+        // Versions before quick play take the older --server/--port pair.
+        let (host, port) = match server.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => (host.to_string(), port.to_string()),
+            _ => (server.clone(), "25565".to_string()),
+        };
+        args.extend(["--server".into(), host, "--port".into(), port]);
+    }
     if let (Some((width, height)), true) = (resolution, info.minecraft_arguments.is_some()) {
         // Legacy argument strings have no resolution placeholders.
         args.extend([
@@ -384,6 +639,7 @@ mod tests {
             updated_at: now,
             last_played: None,
             settings: InstanceSettings::default(),
+            managed: None,
         };
         let auth = LaunchAuth {
             username: "Steve".into(),

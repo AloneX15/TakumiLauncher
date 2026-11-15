@@ -50,6 +50,7 @@ const STAGES = {
   auth: 'Iniciando sesión…',
   metadata: 'Preparando…',
   repair: 'Comprobando archivos…',
+  sync: 'Actualizando la instancia privada',
   downloading: 'Descargando',
   java: 'Instalando Java',
   loader: 'Instalando el cargador de mods',

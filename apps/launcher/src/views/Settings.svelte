@@ -1,8 +1,10 @@
 <script>
   import { invoke, openExternal } from '../lib/api.js';
   import { appInfo, attempt, settingsView, toast } from '../lib/stores.js';
+  import { experience } from '../lib/experience.js';
 
-  const AZURE_PORTAL = 'https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade';
+  const AZURE_PORTAL =
+    'https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade';
 
   // Edit a copy; the store only changes once the backend has saved it.
   let draft = { ...$settingsView.settings, java_path: $settingsView.settings.java_path ?? '' };
@@ -41,6 +43,38 @@
 </header>
 
 <section class="card">
+  <h2>Experiencia de la interfaz</h2>
+  <p class="muted help">
+    Pequeños detalles que acompañan cada interacción. Se guardan automáticamente en este
+    dispositivo.
+  </p>
+  <label class="row check preference">
+    <input type="checkbox" bind:checked={$experience.sound} />
+    <span>Sonidos al interactuar</span>
+  </label>
+  <label class="field">
+    <span>Volumen de los efectos: {$experience.volume}%</span>
+    <input
+      aria-label="Volumen de los efectos"
+      type="range"
+      min="0"
+      max="100"
+      step="5"
+      disabled={!$experience.sound}
+      bind:value={$experience.volume}
+    />
+  </label>
+  <label class="row check">
+    <input type="checkbox" bind:checked={$experience.reducedMotion} />
+    <span
+      >Reducir animaciones <span class="muted small"
+        >· También respetamos la preferencia de tu sistema.</span
+      ></span
+    >
+  </label>
+</section>
+
+<section class="card">
   <h2>Java y rendimiento</h2>
 
   <label class="field">
@@ -63,7 +97,8 @@
     <span>
       Optimizar el juego automáticamente
       <span class="muted small">
-        — ajusta la memoria y el recolector de basura de Java y da prioridad al juego. Tus argumentos tienen preferencia.
+        — ajusta la memoria y el recolector de basura de Java y da prioridad al juego. Tus
+        argumentos tienen preferencia.
       </span>
     </span>
   </label>
@@ -80,9 +115,12 @@
 <section class="card">
   <h2>Inicio de sesión con Microsoft</h2>
   <p class="muted help">
-    Microsoft exige que cada launcher use su propia aplicación registrada en Azure, con «flujos de cliente público»
-    activados y el permiso de la API de Minecraft aprobado por Mojang. Pega aquí su ID de aplicación (cliente).
-    <button class="ghost link" on:click={() => openExternal(AZURE_PORTAL)}>Abrir Azure Portal</button>
+    Microsoft exige que cada launcher use su propia aplicación registrada en Azure, con «flujos de
+    cliente público» activados y el permiso de la API de Minecraft aprobado por Mojang. Pega aquí su
+    ID de aplicación (cliente).
+    <button class="ghost link" on:click={() => openExternal(AZURE_PORTAL)}
+      >Abrir Azure Portal</button
+    >
   </p>
   <label class="field">
     <span>ID de cliente</span>
@@ -125,6 +163,9 @@
 
   .check {
     cursor: pointer;
+  }
+  .preference {
+    margin-bottom: 18px;
   }
 
   .help {

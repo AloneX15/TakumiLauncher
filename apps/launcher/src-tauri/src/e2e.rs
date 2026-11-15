@@ -10,9 +10,10 @@
 //!     cargo test -p takumi-launcher e2e -- --ignored --nocapture
 //! ```
 
-use crate::accounts::{offline_account, Accounts};
+use crate::accounts::{takumi_offline_account, Accounts};
 use crate::install;
 use crate::launch::{self, LaunchSink};
+use crate::session::TakumiSession;
 use crate::state::AppState;
 use download_manager::DownloadProgress;
 use instance_manager::NewInstance;
@@ -69,7 +70,15 @@ async fn e2e_install_and_launch() {
 
     let state = AppState::new(root).unwrap();
     let mut accounts = Accounts::default();
-    accounts.upsert(offline_account("TakumiTest").unwrap());
+    // The offline profile comes from the Takumi account (session.json in this root).
+    TakumiSession {
+        username: "TakumiTest".into(),
+        email: String::new(),
+        role: "user".into(),
+    }
+    .save(&state.root)
+    .unwrap();
+    accounts.upsert(takumi_offline_account("TakumiTest"));
     accounts.save(&state.root).unwrap();
 
     let available = install::loader_versions(&state, loader, &version).await.unwrap();
@@ -216,4 +225,138 @@ async fn e2e_content_and_modpack() {
     );
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Full private-instance run against a TakumiWeb with a published Fabric instance (Fabric API + Takumi Gate in
+/// `mods/`) whose server address points at a running Takumi Gate server in offline mode:
+///
+/// ```text
+/// TAKUMI_WEB_URL=http://localhost:5180 TAKUMI_PRIVATE_ID=<uuid> TAKUMI_PRIVATE_TOKEN=<member launcher token> \
+///     cargo test -p takumi-launcher e2e_private -- --ignored --nocapture
+/// ```
+///
+/// Checks: sync into the vault, launch with a join ticket, the Gate server lets the player in, `mods/` and
+/// `.fabric/processedMods/` cannot be read while the game runs (and the game keeps working), "Reiniciar y
+/// actualizar" closes the game and starts it again, and nothing decrypted is left once it stops.
+/// Uses its own keyring entry, never the user's session.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TakumiWeb, a Takumi Gate server, downloads the game and opens a window"]
+async fn e2e_private_instance() {
+    use crate::private_runtime as runtime;
+
+    let id: uuid::Uuid = std::env::var("TAKUMI_PRIVATE_ID").unwrap().parse().unwrap();
+    let token = std::env::var("TAKUMI_PRIVATE_TOKEN").unwrap();
+    let root: std::path::PathBuf = std::env::var("TAKUMI_E2E_ROOT")
+        .map(Into::into)
+        .unwrap_or_else(|_| std::env::temp_dir().join("takumi-launcher-e2e"));
+    let service = format!("TakumiLauncher-e2e-{}", std::process::id());
+    let mut state = AppState::new(root).unwrap();
+    state.vault = auth_system::TokenVault::new(&service);
+    state.vault.store("takumi-session", &token).unwrap();
+    // Removes the test token from the keyring even if the test fails.
+    struct ForgetToken(String);
+    impl Drop for ForgetToken {
+        fn drop(&mut self) {
+            let _ = auth_system::TokenVault::new(&self.0).delete("takumi-session");
+        }
+    }
+    let _forget = ForgetToken(service.clone());
+    let mut accounts = Accounts::default();
+    // The offline profile comes from the Takumi account (session.json in this root).
+    TakumiSession {
+        username: "TakumiTest".into(),
+        email: String::new(),
+        role: "user".into(),
+    }
+    .save(&state.root)
+    .unwrap();
+    accounts.upsert(takumi_offline_account("TakumiTest"));
+    accounts.save(&state.root).unwrap();
+
+    {
+        crate::private_instances::sync_with_token(&state, id, &token, &PrintSink)
+            .await
+            .unwrap();
+        let game = state.instances.game_dir(id);
+
+        let (lines_tx, mut lines) = mpsc::unbounded_channel();
+        let sink = LineSink(lines_tx);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let run = launch::run(&state, id, stop_rx, &sink);
+        tokio::pin!(run);
+
+        async fn wait_for(
+            lines: &mut mpsc::UnboundedReceiver<String>,
+            what: &str,
+            run: &mut std::pin::Pin<&mut impl std::future::Future<Output = anyhow::Result<Option<i32>>>>,
+        ) {
+            tokio::select! {
+                result = run.as_mut() => panic!("the game stopped while waiting for '{what}': {result:?}"),
+                _ = async { while let Some(line) = lines.recv().await { if line.contains(what) { break; } } } => {}
+                _ = tokio::time::sleep(Duration::from_secs(900)) => panic!("timed out waiting for '{what}'"),
+            }
+            println!(">>> {what}");
+        }
+
+        wait_for(&mut lines, "Carpeta de mods bloqueada", &mut run).await;
+        let jar = std::fs::read_dir(state.instances.instance_dir(id).join("vault/objects"))
+            .unwrap()
+            .count();
+        assert!(jar > 0, "event files are in the vault");
+        assert!(
+            std::fs::read_dir(game.join("mods")).is_err(),
+            "mods/ cannot be listed while playing"
+        );
+        assert!(
+            std::fs::read_dir(game.join(".fabric/processedMods")).is_err(),
+            "processedMods cannot be listed while playing"
+        );
+
+        // The Takumi Gate server accepts the ticket the launcher asked for, and the game loads the world with
+        // the folders locked.
+        // Quick play connects to the event server; the Gate checks the ticket during login (the server log shows
+        // "TakumiTest joined the game"). The game must keep running in the world with the folders locked.
+        wait_for(&mut lines, "Connecting to localhost", &mut run).await;
+        tokio::select! {
+            result = run.as_mut() => panic!("the game stopped in the world: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(45)) => {}
+        }
+
+        // "Reiniciar y actualizar": the mod closes the game and the launcher starts it again.
+        runtime::request_restart(&game).unwrap();
+        wait_for(&mut lines, "Reiniciando para aplicar", &mut run).await;
+        wait_for(&mut lines, "Carpeta de mods bloqueada", &mut run).await;
+
+        stop_tx.send(()).unwrap();
+        assert_eq!(run.await.unwrap(), None);
+        let left: Vec<_> = std::fs::read_dir(game.join("mods"))
+            .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "decrypted mods left behind: {left:?}");
+        assert!(
+            !game.join(".fabric/processedMods").exists(),
+            "extracted jars left behind"
+        );
+    }
+}
+
+struct PrintSink;
+
+impl LaunchSink for PrintSink {
+    fn status(&self, _stage: &str, _progress: Option<DownloadProgress>) {}
+    fn log(&self, line: String) {
+        println!("[sync] {line}");
+    }
+}
+
+struct LineSink(mpsc::UnboundedSender<String>);
+
+impl LaunchSink for LineSink {
+    fn status(&self, _stage: &str, _progress: Option<DownloadProgress>) {}
+    fn log(&self, line: String) {
+        if line.contains("[Takumi]") || line.contains("Connecting to") || line.contains("ERROR") {
+            println!("[game] {line}");
+        }
+        let _ = self.0.send(line);
+    }
 }
